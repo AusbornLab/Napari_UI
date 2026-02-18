@@ -1,0 +1,7 @@
+#Python virtual environment
+venv/
+env/
+.venv/
+*.pyc
+__pycache__/
+napari_env/
