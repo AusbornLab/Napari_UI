@@ -31,12 +31,21 @@ Python can be downloaded from the following website
 https://www.python.org/downloads/release/python-3119/
 
 
+### Pulling the github repository
+To pull the current version of the repository generate a folder in your directory
+ - Navigate to that directory in a command prompt, or use a simple IDE like Visual Studio Code (https://code.visualstudio.com/download)
+ - run the following command in the terminal
+ git clone https://github.com/AusbornLab/Napari_UI.git
+ - This generates a copy of the repository in your directory folder
+ - Then change to the directory of the of the repository folder by using the following command 
+ - cd Napari_UI, this pulls you to your new folder
+
 ########################
 
 ### Setting up virtual env. ###
 Once python 3.11.9 is installed the following packages and versions must be install in a virtual env.
-- open up a command prompt, 
-- navigate to the napari folder
+- open up a command prompt, or terminal via VS Code 
+- navigate to the napari folder pulled from the github repository
 
 #If you are using a windows machine use the following commands
 - Generate virtual env, with the following: 
@@ -50,15 +59,20 @@ Once python 3.11.9 is installed the following packages and versions must be inst
 ########################
 
 Activation of the virtual environment
-- In your napari folder a new folder named napari_env should be there now.
+- In your napari_UI folder a new folder named napari_env should be there now.
 
 #If you are using a windows machine use the following commands in the command terminal
-- use the following in a cmd line .\napari_env\Scripts\activate.bat
+- if using a cmd line .\napari_env\Scripts\activate.bat
+- if using a powershell .\napari_env\Scripts\Activate.ps1
 
 #If you are using a Mac, use the following commands
 - use the following in a terminal (bash/zsh):
     source napari_env/bin/activate
 
+This activates your napari_env, where the installation of packages will be done
+
+#If you wish to deactivate the envirnment
+ - In the command line use the command deactivate
 
 ########################
 
