@@ -91,6 +91,3 @@ Installation of packages
 
 #If you are using a mac machine then use the following command to star the user interface
 - python3.11 Napari_UI.py
-
-
-### C
