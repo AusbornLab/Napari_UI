@@ -1,6 +1,10 @@
 import numpy as np
 import json
 import csv
+import sys
+import os
+import time
+import napari
 from datetime import datetime
 from pathlib import Path
 from qtpy.QtWidgets import (
@@ -10,27 +14,24 @@ from qtpy.QtWidgets import (
     QListWidgetItem, QDialogButtonBox, QDoubleSpinBox, QInputDialog, QLineEdit
 )
 from qtpy.QtCore import Qt
-import napari
+
 from skimage.filters import gaussian, threshold_otsu
 from skimage.morphology import remove_small_objects, closing, disk, dilation
 from aicsimageio import AICSImage
 import tifffile
-import tempfile
-import shutil
 import imageio
-import imageio.v3 as iio  
 from skimage.transform import rotate
 from skimage.measure import label, regionprops
 from skimage.segmentation import watershed  
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 from qtpy.QtGui import QIntValidator
-import time
 from skimage.draw import polygon as sk_polygon  
 from scipy import ndimage as ndi
-import csv
-import sys
-import os
+from skimage.draw import polygon2mask
+import re
+import xml.etree.ElementTree as ET
+
+
 
 
 
@@ -41,7 +42,7 @@ import os
 
 def load_lif_memmap(path, scene_index=0, max_ch=4):
     """Load LIF using memory mapping for instant slice access without RAM overhead.
-    Returns (list_of_memmaps, contrast_limits_dict, voxel_size).
+    Returns (list_of_memmaps, contrast_limits_dict, voxel_size(Z,Y,X), paths).
     """
     print("Creating memory-mapped arrays from LIF (memmap)...")
     img = AICSImage(str(path))
@@ -60,42 +61,37 @@ def load_lif_memmap(path, scene_index=0, max_ch=4):
     except Exception:
         arr = img.get_image_dask_data("CYX", S=scene_index)
 
-    shape = arr.shape
+    print(f"Image array shape (expected C,Z,Y,X or C,Y,X): {arr.shape}")
 
-    print(f"Image array shape (expected C,Z,Y,X or C,Y,X): {shape}")
-
-    # Attempt to extract voxel spacing
     voxel_size = (1.0, 1.0, 1.0)
     try:
-        if hasattr(img, 'get_physical_pixel_size'):
-            p = img.get_physical_pixel_size()
-            if isinstance(p, (list, tuple)) and len(p) >= 3:
-                voxel_size = (float(p[0]), float(p[1]), float(p[2]))
-            elif isinstance(p, dict):
-                voxel_size = (
-                    float(p.get('Z', 1.0)),
-                    float(p.get('Y', 1.0)),
-                    float(p.get('X', 1.0)),
-                )
-        elif hasattr(img, 'physical_pixel_sizes'):
-            p = img.physical_pixel_sizes
-            if isinstance(p, (list, tuple)) and len(p) >= 3:
-                voxel_size = (float(p[0]), float(p[1]), float(p[2]))
-        elif hasattr(img, 'metadata'):
-            md = getattr(img, 'metadata')
-            pz = md.get('PhysicalSizeZ') or md.get('physical_pixel_size_z')
-            py = md.get('PhysicalSizeY') or md.get('physical_pixel_size_y')
-            px = md.get('PhysicalSizeX') or md.get('physical_pixel_size_x')
-            if pz is not None and py is not None and px is not None:
-                voxel_size = (float(pz), float(py), float(px))
+        p = getattr(img, "physical_pixel_sizes", None)
+        if p is not None:
+            # NamedTuple: PhysicalPixelSizes(Z=..., Y=..., X=...) 
+            if hasattr(p, "Z") and hasattr(p, "Y") and hasattr(p, "X"):
+                z = p.Z
+                y = p.Y
+                x = p.X
+            else:
+                # tuple-like; docs indicate order Z,Y,X 
+                z, y, x = tuple(p)[:3]
+
+            if z is not None and y is not None and x is not None:
+                voxel_size = (float(z), float(y), float(x))
+        else:
+            # Older AICSImageIO API: returns X,Y,Z 
+            if hasattr(img, "get_physical_pixel_size"):
+                pxyz = img.get_physical_pixel_size(scene_index)
+                if isinstance(pxyz, (list, tuple)) and len(pxyz) >= 3:
+                    x, y, z = pxyz[:3]
+                    voxel_size = (float(z), float(y), float(x))
     except Exception:
         pass
 
     # Create temporary memory-mapped files
-    temp_dir = Path(r"D:\Imaging Pipeline\Napari\napari_coloc_temp")
-    temp_dir.mkdir(exist_ok=True)
+    temp_dir = Path.cwd() / "napari_mmap_files"
+    temp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Determine Z,Y,X shape depending on arr.ndim
     # Normalize arr to shape (C,Z,Y,X) where possible
     if arr.ndim == 4:
         c, z, y, x = arr.shape
@@ -114,10 +110,10 @@ def load_lif_memmap(path, scene_index=0, max_ch=4):
     memmaps = []
     paths = []
     for ch_idx in range(min(n_ch, c)):
-        p = temp_dir / f"ch{ch_idx+1}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.dat"
-        mm = np.memmap(p, dtype=np.float32, mode='w+', shape=(n_z, y, x))
+        pth = temp_dir / f"ch{ch_idx+1}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.dat"
+        mm = np.memmap(pth, dtype=np.float32, mode='w+', shape=(n_z, y, x))
         memmaps.append(mm)
-        paths.append(p)
+        paths.append(pth)
 
     print("Writing data to memory-mapped files (this may take a few minutes)...")
     chunk_size = 30
@@ -126,11 +122,9 @@ def load_lif_memmap(path, scene_index=0, max_ch=4):
     for idx, start_z in enumerate(range(0, n_z, chunk_size)):
         end_z = min(start_z + chunk_size, n_z)
         for ch_i in range(len(memmaps)):
-            # arr index depends on dims
             if arr.ndim == 4:
                 chunk = arr[ch_i, start_z:end_z].compute().astype(np.float32)
             else:
-                # arr.ndim == 3 and c expected
                 chunk = arr[ch_i][np.newaxis, ...].astype(np.float32)
 
             memmaps[ch_i][start_z:end_z] = chunk
@@ -158,78 +152,219 @@ def load_lif_memmap(path, scene_index=0, max_ch=4):
         contrast_limits[f'ch{i}'] = (float(lo), float(hi))
 
     print(f"Voxel size (Z, Y, X): {voxel_size}")
-
     return memmaps, contrast_limits, voxel_size, paths
 
+
 def load_tiff_memmap(path, max_ch=4):
-    """Load TIFF using memory-mapped arrays via AICSImage to avoid loading into RAM.
-    Returns (list_of_memmaps, contrast_limits_dict, voxel_size).
+    """Load TIFF using memory-mapped arrays via tifffile, write float32 memmaps.
+    Returns (list_of_memmaps, contrast_limits_dict, voxel_size(Z,Y,X), paths).
+    Tries to extract voxel size from:
+      1) OME-TIFF OME-XML
+      2) ImageJ metadata
+      3) TIFF resolution tags
     """
+
     print("Creating memory-mapped arrays from TIFF (memmap) using tifffile...")
-    # Try to get a memory-mapped array directly from tifffile (avoids zarr/numcodecs path)
+
+    # ---------- voxel size extraction helpers ----------
+    def _safe_float(x):
+        try:
+            if x is None:
+                return None
+            return float(x)
+        except Exception:
+            return None
+
+    def _parse_ome_voxel_size(tif):
+        """Return (Z,Y,X) in microns if possible, else None."""
+        ome = getattr(tif, "ome_metadata", None)
+        if not ome:
+            return None
+        try:
+            root = ET.fromstring(ome)
+            # Find first Pixels element (ignore namespaces by matching suffix)
+            pixels = None
+            for el in root.iter():
+                if el.tag.endswith("Pixels"):
+                    pixels = el
+                    break
+            if pixels is None:
+                return None
+
+            psx = _safe_float(pixels.attrib.get("PhysicalSizeX"))
+            psy = _safe_float(pixels.attrib.get("PhysicalSizeY"))
+            psz = _safe_float(pixels.attrib.get("PhysicalSizeZ"))
+
+            # Units exist too, but we assume µm if present/typical; you can extend conversion later.
+            # If any are missing, keep None.
+            if psx is None and psy is None and psz is None:
+                return None
+
+            # OME uses X,Y,Z naming; return (Z,Y,X)
+            z = 1.0 if psz is None else float(psz)
+            y = 1.0 if psy is None else float(psy)
+            x = 1.0 if psx is None else float(psx)
+            return (z, y, x)
+        except Exception:
+            return None
+
+    def _resolution_unit_to_microns(unit_code_or_str):
+        """
+        TIFF ResolutionUnit: 2=inches, 3=centimeters (common).
+        Return microns per unit.
+        """
+        try:
+            # tifffile may return an int or an enum-like
+            u = unit_code_or_str
+            if hasattr(u, "value"):
+                u = u.value
+            if isinstance(u, str):
+                s = u.lower()
+                if "inch" in s:
+                    return 25400.0
+                if "centimeter" in s or "cm" == s:
+                    return 10000.0
+                return None
+            # numeric
+            if int(u) == 2:   # inch
+                return 25400.0
+            if int(u) == 3:   # centimeter
+                return 10000.0
+            return None
+        except Exception:
+            return None
+
+    def _parse_tiff_resolution_xy(tif):
+        """Return (Y,X) microns-per-pixel from TIFF tags if present, else None."""
+        try:
+            page0 = tif.pages[0]
+            tags = page0.tags
+
+            # XResolution/YResolution are rational pixels per ResolutionUnit
+            if "XResolution" not in tags or "YResolution" not in tags or "ResolutionUnit" not in tags:
+                return None
+
+            xres = tags["XResolution"].value
+            yres = tags["YResolution"].value
+            unit = tags["ResolutionUnit"].value
+
+            # Convert rationals to float (pixels per unit)
+            xres_f = float(xres[0]) / float(xres[1]) if isinstance(xres, tuple) else float(xres)
+            yres_f = float(yres[0]) / float(yres[1]) if isinstance(yres, tuple) else float(yres)
+
+            microns_per_unit = _resolution_unit_to_microns(unit)
+            if microns_per_unit is None:
+                return None
+
+            # pixel size (units/pixel) = (microns/unit) / (pixels/unit)
+            px = microns_per_unit / xres_f if xres_f > 0 else None
+            py = microns_per_unit / yres_f if yres_f > 0 else None
+            if px is None or py is None:
+                return None
+            return (float(py), float(px))
+        except Exception:
+            return None
+
+    def _parse_imagej_voxel_size(tif):
+        """
+        ImageJ TIFF:
+          - Z spacing often in imagej_metadata['spacing'] (in units of 'unit') 
+          - XY sometimes via TIFF resolution tags; ImageJ may also embed things in ImageDescription.
+        """
+        try:
+            ij = getattr(tif, "imagej_metadata", None)
+            if not ij:
+                return None
+
+            unit = ij.get("unit", None)  # often 'um' 
+            spacing = _safe_float(ij.get("spacing", None))  # z spacing
+
+            # XY: best effort via TIFF tags
+            yx = _parse_tiff_resolution_xy(tif)
+
+            # If unit is not microns, we don't convert here (extend if you need)
+            # We'll still return values as-is; but prefer microns.
+            if yx is None and spacing is None:
+                return None
+
+            # default XY if missing
+            y = 1.0
+            x = 1.0
+            if yx is not None:
+                y, x = yx
+
+            z = 1.0 if spacing is None else float(spacing)
+            return (z, float(y), float(x))
+        except Exception:
+            return None
+
+    def _parse_generic_voxel_size(tif):
+        """Generic fallback: XY from resolution tags, Z unknown."""
+        yx = _parse_tiff_resolution_xy(tif)
+        if yx is None:
+            return None
+        y, x = yx
+        return (1.0, float(y), float(x))
+
+    # ---------- read pixels (prefer memmap) ----------
     try:
         data = tifffile.memmap(str(path))
         arr = np.asarray(data)
-        axes = None
     except Exception:
-        # As a fallback, try a direct read (may load into RAM on older tifffile versions)
         try:
             arr = tifffile.imread(str(path))
-            axes = None
         except Exception as e:
-            # Last-resort: try AICSImage but only if tifffile fails
+            # last resort: AICSImage -> delegate
+            img = AICSImage(str(path))
             try:
-                img = AICSImage(str(path))
-                try:
-                    arr = img.get_image_dask_data("CZYX")
-                except Exception:
-                    arr = img.get_image_dask_data("CYX")
-                # delegate to existing LIF path which handles dask arrays
-                try:
-                    c_total = int(img.dims.C)
-                except Exception:
-                    if arr.ndim == 4:
-                        c_total = arr.shape[0]
-                    else:
-                        c_total = 1
-                return load_lif_memmap(path, scene_index=0, max_ch=min(max_ch, max(1, c_total)))
+                arr = img.get_image_dask_data("CZYX")
             except Exception:
-                raise RuntimeError(f"Failed to read TIFF with tifffile and AICSImage: {e}")
+                arr = img.get_image_dask_data("CYX")
+            try:
+                c_total = int(img.dims.C)
+            except Exception:
+                c_total = arr.shape[0] if arr.ndim == 4 else 1
+            return load_lif_memmap(path, scene_index=0, max_ch=min(max_ch, max(1, c_total)))
 
-    # Normalize array into shape (C, Z, Y, X) using heuristics for common TIFF layouts
+    # ---------- extract voxel size ----------
+    voxel_size = (1.0, 1.0, 1.0)
+    try:
+        with tifffile.TiffFile(str(path)) as tif:
+            vs = _parse_ome_voxel_size(tif)
+            if vs is None:
+                vs = _parse_imagej_voxel_size(tif)
+            if vs is None:
+                vs = _parse_generic_voxel_size(tif)
+            if vs is not None:
+                voxel_size = tuple(map(float, vs))
+    except Exception:
+        pass
+
+    # ---------- normalize array into (C, Z, Y, X) ----------
     arr = np.asarray(arr)
     if arr.ndim == 4:
-        # Heuristic: if first axis is small (<=4) and second axis is large, assume (C,Z,Y,X)
         a0, a1, a2, a3 = arr.shape
         if a0 <= 4 and a1 > 4:
             arr_czyx = arr  # (C,Z,Y,X)
         elif a1 <= 4 and a0 > 4:
-            # assume (Z,C,Y,X) -> swap first two axes to get (C,Z,Y,X)
-            arr_czyx = np.moveaxis(arr, [0, 1], [1, 0])
+            arr_czyx = np.moveaxis(arr, [0, 1], [1, 0])  # (Z,C,Y,X)->(C,Z,Y,X)
         else:
-            # fallback: assume (C,Z,Y,X)
             arr_czyx = arr
     elif arr.ndim == 3:
-        # (Z,Y,X) -> add channel axis
-        arr_czyx = np.expand_dims(arr, axis=0)
+        arr_czyx = np.expand_dims(arr, axis=0)  # (1,Z,Y,X)
     elif arr.ndim == 2:
-        # (Y,X) -> add channel and Z axes
-        arr_czyx = arr.reshape((1, 1) + arr.shape)
+        arr_czyx = arr.reshape((1, 1) + arr.shape)  # (1,1,Y,X)
     else:
-        # unexpected rank: try to coerce to (1,1,Y,X)
         arr_czyx = np.reshape(arr, (1, 1) + arr.shape[-2:])
 
-    # Now arr_czyx should be (C,Z,Y,X)
     c_total = arr_czyx.shape[0]
     n_ch = min(max_ch, max(1, c_total))
 
-    # Create temp memmaps and write per-channel data in chunks (reuse logic from LIF loader)
-    temp_dir = Path(r"D:\Imaging Pipeline\Napari\napari_coloc_temp")
-    temp_dir.mkdir(exist_ok=True)
+    # ---------- write float32 memmaps ----------
+    temp_dir = Path.cwd() / "napari_mmap_files"
+    temp_dir.mkdir(parents=True, exist_ok=True)
 
-    n_z = arr_czyx.shape[1]
-    y = arr_czyx.shape[2]
-    x = arr_czyx.shape[3]
+    n_z, y, x = arr_czyx.shape[1], arr_czyx.shape[2], arr_czyx.shape[3]
 
     memmaps = []
     paths = []
@@ -245,9 +380,10 @@ def load_tiff_memmap(path, max_ch=4):
     for idx, start_z in enumerate(range(0, n_z, chunk_size)):
         end_z = min(start_z + chunk_size, n_z)
         for ch_i in range(n_ch):
-            chunk = arr_czyx[ch_i, start_z:end_z].astype(np.float32)
+            chunk = arr_czyx[ch_i, start_z:end_z].astype(np.float32, copy=False)
             memmaps[ch_i][start_z:end_z] = chunk
             memmaps[ch_i].flush()
+
         elapsed = time.time() - start_time
         chunks_done = idx + 1
         total_chunks = (n_z + chunk_size - 1) // chunk_size
@@ -256,7 +392,7 @@ def load_tiff_memmap(path, max_ch=4):
         est_remaining = remaining_chunks * time_per_chunk
         print(f"  Processed slices {start_z}-{end_z-1} of {n_z-1} ({elapsed:.1f}s elapsed, ~{est_remaining:.1f}s remaining)")
 
-    # contrast limits
+    # ---------- contrast limits ----------
     contrast_limits = {}
     mid_z = max(0, n_z // 2)
     for i, mm in enumerate(memmaps, start=1):
@@ -267,9 +403,7 @@ def load_tiff_memmap(path, max_ch=4):
             lo, hi = 0, 65535
         contrast_limits[f'ch{i}'] = (float(lo), float(hi))
 
-    # approximate voxel size unknown for generic TIFF
-    voxel_size = (1.0, 1.0, 1.0)
-
+    print(f"Voxel size (Z, Y, X): {voxel_size}")
     print("Memory-mapped TIFF files created successfully!")
     return memmaps, contrast_limits, voxel_size, paths
 
@@ -980,6 +1114,8 @@ class UIWidget(QWidget):
         self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.coloc_controls = getattr(self, "coloc_controls", [])
         self.coloc_control_boxes = getattr(self, "coloc_control_boxes", [])
+        arr = np.asarray(channel_list[0])
+        print("dtype:", arr.dtype, "shape:", arr.shape, "min/max:", float(np.min(arr)), float(np.max(arr)))
 
     def build_ui(self):
         layout = self.layout()
@@ -994,59 +1130,114 @@ class UIWidget(QWidget):
         z_box.setLayout(z_layout)
         layout.addWidget(z_box)
 
-        # Determine a sensible max_range for sliders
-        max_range = 65535
-        try:
-            vals = [int(v[1]) for v in self.contrast_limits.values()]
-            if vals:
-                mr = max(vals)
-                max_range = max(1000, min(mr * 2, 65535))
-        except Exception:
-            pass
+        def infer_max_range_from_channels(channel_list, fallback=65535):
+            try:
+                best_dtype = None
+                best_p99 = 0.0
+                best_max = 0.0
 
-        # Per-channel controls (replicate Channel 1 widgets from full UI)
+                for ch in channel_list:
+                    arr = np.asarray(ch)
+                    if best_dtype is None:
+                        best_dtype = arr.dtype
+
+                    # sample a few z planes
+                    if arr.ndim == 3 and arr.shape[0] > 1:
+                        z_idx = [0, arr.shape[0] // 2, arr.shape[0] - 1]
+                        sample = np.asarray(arr[z_idx, ...]).ravel()
+                    else:
+                        sample = arr.ravel()
+
+                    if np.issubdtype(sample.dtype, np.floating):
+                        sample = sample[np.isfinite(sample)]
+
+                    if sample.size == 0:
+                        continue
+
+                    best_max = max(best_max, float(np.max(sample)))
+                    best_p99 = max(best_p99, float(np.percentile(sample, 99)))
+
+                # integer range
+                if best_dtype is not None and np.issubdtype(best_dtype, np.integer):
+                    return int(min(np.iinfo(best_dtype).max, fallback))
+
+                # float range
+                v = best_p99 if best_p99 > 0 else best_max
+                if v <= 0:
+                    return fallback
+
+                if v <= 255: return 255
+                if v <= 4095: return 4095
+                if v <= 65535: return 65535
+                return int(min(v, fallback))
+
+            except Exception:
+                return fallback
+
+        max_range = infer_max_range_from_channels(self.channel_list, fallback=65535)
+
+        # Per-channel controls
         for idx, layer in enumerate(self.channel_layers, start=1):
             gb = QGroupBox(f'Channel {idx} Controls')
             vlay = QVBoxLayout()
 
-            # Visibility + Opacity row
+            # Visibility + opacity
             top_h = QHBoxLayout()
             vis_cb = QCheckBox('Visible')
             vis_cb.setChecked(True)
             vis_cb.stateChanged.connect(lambda s, lyr=layer: setattr(lyr, 'visible', bool(s)))
             top_h.addWidget(vis_cb)
+
             top_h.addWidget(QLabel('Opacity'))
             op = QSlider(Qt.Horizontal)
             op.setRange(0, 100)
             op.setValue(int(layer.opacity * 100))
-            op.valueChanged.connect(lambda v, lyr=layer: setattr(lyr, 'opacity', v/100.0))
+            op.valueChanged.connect(lambda v, lyr=layer: setattr(lyr, 'opacity', v / 100.0))
             top_h.addWidget(op)
-            # Color picker button (per-channel)
+
+            # Color picker
             color_btn = QPushButton('Color')
             def make_color_picker(lyr):
                 def pick():
                     col = QColorDialog.getColor(parent=self)
-                    if not col.isValid():
-                        return
-                    lyr.colormap = col.name()
+                    if col.isValid():
+                        try:
+                            lyr.colormap = col.name()
+                        except Exception:
+                            pass
                 return pick
-
             color_btn.clicked.connect(make_color_picker(layer))
             top_h.addWidget(color_btn)
+
             vlay.addLayout(top_h)
 
-            # Contrast min/max
+            # ---------------------------------------------------
+            # MIN / MAX CONTRAST SLIDERS (kept)
+            # ---------------------------------------------------
             ch_min_layout = QHBoxLayout()
             ch_min_layout.addWidget(QLabel('Min:'))
             ch_min = QSlider(Qt.Horizontal)
             ch_min.setRange(0, max_range)
-            lim = self.contrast_limits.get(f'ch{idx}', (0, max_range))
+
+            try:
+                lim = self.contrast_limits.get(f'ch{idx}', None)
+            except Exception:
+                lim = None
+            if lim is None:
+                try:
+                    lim = tuple(layer.contrast_limits)
+                except Exception:
+                    lim = (0, max_range)
+
             ch_min.setValue(int(lim[0]))
             ch_min_layout.addWidget(ch_min)
+
             ch_min_val = QLineEdit(str(int(lim[0])))
             ch_min_val.setFixedWidth(80)
             ch_min_val.setValidator(QIntValidator(0, max_range))
-            ch_min_val.editingFinished.connect(lambda le=ch_min_val, sl=ch_min: self._set_slider_from_lineedit(le, sl, 0, max_range))
+            ch_min_val.editingFinished.connect(
+                lambda le=ch_min_val, sl=ch_min: self._set_slider_from_lineedit(le, sl, 0, max_range)
+            )
             ch_min_layout.addWidget(ch_min_val)
             vlay.addLayout(ch_min_layout)
 
@@ -1056,92 +1247,72 @@ class UIWidget(QWidget):
             ch_max.setRange(0, max_range)
             ch_max.setValue(int(lim[1]))
             ch_max_layout.addWidget(ch_max)
+
             ch_max_val = QLineEdit(str(int(lim[1])))
             ch_max_val.setFixedWidth(80)
             ch_max_val.setValidator(QIntValidator(0, max_range))
-            ch_max_val.editingFinished.connect(lambda le=ch_max_val, sl=ch_max: self._set_slider_from_lineedit(le, sl, 0, max_range))
+            ch_max_val.editingFinished.connect(
+                lambda le=ch_max_val, sl=ch_max: self._set_slider_from_lineedit(le, sl, 0, max_range)
+            )
             ch_max_layout.addWidget(ch_max_val)
             vlay.addLayout(ch_max_layout)
 
-            # Connect to update contrast
-            def make_update_contrast(i, lyr, a=ch_min, b=ch_max):
-                def f(_=None):
-                    try:
-                        lyr.contrast_limits = (int(a.value()), int(b.value()))
-                    except Exception:
-                        pass
-                return f
-            ch_min.valueChanged.connect(make_update_contrast(idx-1, layer))
-            ch_max.valueChanged.connect(make_update_contrast(idx-1, layer))
+            # Apply min/max updates to napari
+            def _apply_contrast(_=None, lyr=layer, smin=ch_min, smax=ch_max, le_min=ch_min_val, le_max=ch_max_val):
+                lo = int(smin.value())
+                hi = int(smax.value())
+                if hi < lo:
+                    hi = lo
+                    smax.blockSignals(True)
+                    smax.setValue(hi)
+                    smax.blockSignals(False)
 
-            # Brightness / Contrast percent
-            disp_h = QHBoxLayout()
-            disp_h.addWidget(QLabel('Brightness'))
-            bright = QSlider(Qt.Horizontal)
-            bright.setRange(-2000, 2000)
-            bright.setValue(0)
-            bright_val = QLineEdit('0')
-            bright_val.setFixedWidth(60)
-            bright_val.setValidator(QIntValidator(-2000, 2000))
-            bright_val.editingFinished.connect(lambda le=bright_val, sl=bright: self._set_slider_from_lineedit(le, sl, -2000, 2000))
-            bright.valueChanged.connect(lambda v, le=bright_val: le.setText(str(v)))
-            disp_h.addWidget(bright)
-            disp_h.addWidget(bright_val)
-            disp_h.addWidget(QLabel('Contrast %'))
-            contra = QSlider(Qt.Horizontal)
-            contra.setRange(10, 300)
-            contra.setValue(100)
-            contra_val = QLineEdit(str(contra.value()))
-            contra_val.setFixedWidth(60)
-            contra_val.setValidator(QIntValidator(10, 300))
-            contra_val.editingFinished.connect(lambda le=contra_val, sl=contra: self._set_slider_from_lineedit(le, sl, 10, 300))
-            contra.valueChanged.connect(lambda v, le=contra_val: le.setText(str(int(v))))
-            disp_h.addWidget(contra)
-            disp_h.addWidget(contra_val)
-            vlay.addLayout(disp_h)
+                le_min.setText(str(lo))
+                le_max.setText(str(hi))
 
-            # Hook display update to change layer properties
-            def make_update_display(lyr, br=bright, ct=contra):
-                def fd(_=None):
-                    try:
-                        # brightness shift applied by adjusting contrast_limits center
-                        mn, mx = lyr.contrast_limits if hasattr(lyr, 'contrast_limits') else (0, 65535)
-                        mult = ct.value() / 100.0
-                        shift = br.value()
-                        new_mn = int(max(0, mn * (1.0/mult) + shift))
-                        new_mx = int(max(new_mn+1, mx * (1.0/mult) + shift))
-                        lyr.contrast_limits = (new_mn, new_mx)
-                    except Exception:
-                        pass
-                return fd
-            bright.valueChanged.connect(make_update_display(layer))
-            contra.valueChanged.connect(make_update_display(layer))
+                try:
+                    lyr.contrast_limits = (lo, hi)
+                except Exception:
+                    pass
+
+            ch_min.valueChanged.connect(_apply_contrast)
+            ch_max.valueChanged.connect(_apply_contrast)
+
+            # Initialize text fields
+            ch_min_val.setText(str(int(ch_min.value())))
+            ch_max_val.setText(str(int(ch_max.value())))
 
             gb.setLayout(vlay)
             layout.addWidget(gb)
 
-        # Container for dynamically added mask controls (appear below channels)
+        # Container for dynamic mask controls
         self.mask_container = QVBoxLayout()
         layout.addLayout(self.mask_container)
 
-        # Data analysis and preprocess buttons
+        # Analysis buttons
         btns = QHBoxLayout()
         analysis_btn = QPushButton('Data Analysis')
         analysis_btn.clicked.connect(self.open_analysis)
         btns.addWidget(analysis_btn)
+
         preprocess_btn = QPushButton('Pre-process Analysis')
         preprocess_btn.clicked.connect(self.open_preprocess)
         btns.addWidget(preprocess_btn)
-        layout.addLayout(btns)
 
+        layout.addLayout(btns)
+    
     def _set_slider_from_lineedit(self, lineedit, slider, lo, hi):
         try:
             val = int(lineedit.text())
         except Exception:
             return
         val = max(int(lo), min(int(hi), val))
-        slider.setValue(val)
-    
+        try:
+            lineedit.setText(str(int(val)))
+        except Exception:
+            pass
+        slider.setValue(int(val))
+
     def _get_layer_by_name(self, name):
         for lyr in self.viewer.layers:
             if getattr(lyr, "name", None) == name:
@@ -1373,108 +1544,102 @@ class UIWidget(QWidget):
         op.valueChanged.connect(lambda v, lyr=layer: setattr(lyr, "opacity", v / 100.0))
         top_h.addWidget(op)
 
+        # Color
         color_btn = QPushButton("Color")
         def make_color_picker(lyr):
             def pick():
                 col = QColorDialog.getColor(parent=self)
-                if not col.isValid():
-                    return
-                try:
-                    lyr.colormap = col.name()
-                except Exception:
-                    pass
+                if col.isValid():
+                    try:
+                        lyr.colormap = col.name()
+                    except Exception:
+                        pass
             return pick
         color_btn.clicked.connect(make_color_picker(layer))
         top_h.addWidget(color_btn)
 
         vlay.addLayout(top_h)
 
-        # Contrast min/max
+        # ----------------------------------------------------------
+        # Simple MIN/MAX CONTRAST LIMIT SLIDERS (napari-native)
+        # ----------------------------------------------------------
         lim = self.contrast_limits.get(f"ch{idx}", (0, max_range))
 
+        # Min
         ch_min_layout = QHBoxLayout()
         ch_min_layout.addWidget(QLabel("Min:"))
         ch_min = QSlider(Qt.Horizontal)
         ch_min.setRange(0, max_range)
         ch_min.setValue(int(lim[0]))
         ch_min_layout.addWidget(ch_min)
+
         ch_min_val = QLineEdit(str(int(lim[0])))
         ch_min_val.setFixedWidth(80)
         ch_min_val.setValidator(QIntValidator(0, max_range))
-        ch_min_val.editingFinished.connect(lambda le=ch_min_val, sl=ch_min: self._set_slider_from_lineedit(le, sl, 0, max_range))
+        ch_min_val.editingFinished.connect(
+            lambda le=ch_min_val, sl=ch_min: self._set_slider_from_lineedit(le, sl, 0, max_range)
+        )
         ch_min_layout.addWidget(ch_min_val)
         vlay.addLayout(ch_min_layout)
 
+        # Max
         ch_max_layout = QHBoxLayout()
         ch_max_layout.addWidget(QLabel("Max:"))
         ch_max = QSlider(Qt.Horizontal)
         ch_max.setRange(0, max_range)
         ch_max.setValue(int(lim[1]))
         ch_max_layout.addWidget(ch_max)
+
         ch_max_val = QLineEdit(str(int(lim[1])))
         ch_max_val.setFixedWidth(80)
         ch_max_val.setValidator(QIntValidator(0, max_range))
-        ch_max_val.editingFinished.connect(lambda le=ch_max_val, sl=ch_max: self._set_slider_from_lineedit(le, sl, 0, max_range))
+        ch_max_val.editingFinished.connect(
+            lambda le=ch_max_val, sl=ch_max: self._set_slider_from_lineedit(le, sl, 0, max_range)
+        )
         ch_max_layout.addWidget(ch_max_val)
         vlay.addLayout(ch_max_layout)
 
-        def update_contrast(_=None, lyr=layer, a=ch_min, b=ch_max):
+        # --- update napari contrast limits ---
+        def _apply_contrast_from_sliders(_=None, lyr=layer,
+                                        smin=ch_min, smax=ch_max,
+                                        le_min=ch_min_val, le_max=ch_max_val):
+            lo = int(smin.value())
+            hi = int(smax.value())
+
+            if hi < lo:
+                hi = lo
+                smax.blockSignals(True)
+                smax.setValue(hi)
+                smax.blockSignals(False)
+
+            # keep text boxes synced
+            le_min.setText(str(lo))
+            le_max.setText(str(hi))
+
             try:
-                lyr.contrast_limits = (int(a.value()), int(b.value()))
+                lyr.contrast_limits = (lo, hi)
             except Exception:
                 pass
-        ch_min.valueChanged.connect(update_contrast)
-        ch_max.valueChanged.connect(update_contrast)
 
-        # Brightness / Contrast percent
-        disp_h = QHBoxLayout()
-        disp_h.addWidget(QLabel("Brightness"))
-        bright = QSlider(Qt.Horizontal)
-        bright.setRange(-2000, 2000)
-        bright.setValue(0)
-        bright_val = QLineEdit("0")
-        bright_val.setFixedWidth(60)
-        bright_val.setValidator(QIntValidator(-2000, 2000))
-        bright_val.editingFinished.connect(lambda le=bright_val, sl=bright: self._set_slider_from_lineedit(le, sl, -2000, 2000))
-        bright.valueChanged.connect(lambda v, le=bright_val: le.setText(str(int(v))))
-        disp_h.addWidget(bright)
-        disp_h.addWidget(bright_val)
+        ch_min.valueChanged.connect(_apply_contrast_from_sliders)
+        ch_max.valueChanged.connect(_apply_contrast_from_sliders)
 
-        disp_h.addWidget(QLabel("Contrast %"))
-        contra = QSlider(Qt.Horizontal)
-        contra.setRange(10, 300)
-        contra.setValue(100)
-        contra_val = QLineEdit("100")
-        contra_val.setFixedWidth(60)
-        contra_val.setValidator(QIntValidator(10, 300))
-        contra_val.editingFinished.connect(lambda le=contra_val, sl=contra: self._set_slider_from_lineedit(le, sl, 10, 300))
-        contra.valueChanged.connect(lambda v, le=contra_val: le.setText(str(int(v))))
-        disp_h.addWidget(contra)
-        disp_h.addWidget(contra_val)
-        vlay.addLayout(disp_h)
-
-        def update_display(_=None, lyr=layer, br=bright, ct=contra):
-            try:
-                mn, mx = lyr.contrast_limits
-                mult = ct.value() / 100.0
-                shift = br.value()
-                new_mn = int(max(0, mn * (1.0 / mult) + shift))
-                new_mx = int(max(new_mn + 1, mx * (1.0 / mult) + shift))
-                lyr.contrast_limits = (new_mn, new_mx)
-            except Exception:
-                pass
-        bright.valueChanged.connect(update_display)
-        contra.valueChanged.connect(update_display)
+        # normalize line edits
+        ch_min_val.setText(str(int(ch_min.value())))
+        ch_max_val.setText(str(int(ch_max.value())))
 
         ctrl = {
             "visible_cb": vis_cb,
             "opacity_slider": op,
             "min_slider": ch_min,
             "max_slider": ch_max,
-            "brightness_slider": bright,
-            "contrast_slider": contra,
+            "min_val": ch_min_val,
+            "max_val": ch_max_val,
+            "layer": layer,
+            "groupbox": gb,
         }
         return gb, ctrl
+
 
     def open_analysis(self):
         # Keep a reference so dialog doesn't get garbage-collected
@@ -1505,7 +1670,7 @@ class UIWidget(QWidget):
                     "opacity": float(getattr(layer, "opacity", 1.0)),
                 }
 
-                # napari Image layer properties (safe if present) [web:144]
+                # napari Image layer properties (safe if present) 
                 try:
                     cl = getattr(layer, "contrast_limits", None)
                     if cl is not None:
@@ -1540,7 +1705,7 @@ class UIWidget(QWidget):
 
             metadata = {
                 "original_file": str(original_filename),
-                "timestamp": datetime.now().isoformat(),  # JSON-friendly [web:141]
+                "timestamp": datetime.now().isoformat(),  # JSON-friendly 
                 "current_z_slice": int(getattr(self, "current_z", 0)),
                 "total_z_slices": int(getattr(self, "n_z", 1)),
                 "channels": channels_meta,
@@ -1563,7 +1728,7 @@ class UIWidget(QWidget):
             # Match save_output(): metadata filename is based on self.file_path
             srcp = Path(self.file_path)
             meta_dir = Path("meta_data")
-            metadata_path = meta_dir / (srcp.stem + ".json")  # same stem logic as save_output [web:190]
+            metadata_path = meta_dir / (srcp.stem + ".json")  # same stem logic as save_output 
 
             if not metadata_path.exists():
                 QMessageBox.critical(self, "Not Found", f"No metadata found.\nExpected: {metadata_path}")
@@ -1674,13 +1839,14 @@ class UIWidget(QWidget):
 
     def open_cell_counter(self):
         """
-        Open a separate viewer for cell counting:
-        - User selects one or more layers (channels/masks/derived)
-        - Viewer shows those layers
-        - User draws POSITIVE example ROIs (3D Shapes) around cell bodies on any Z slices
-        - User draws NEGATIVE ROIs (3D Shapes) over processes / junk / background to exclude
-        - Click 'Run detection' to seeded-watershed segment & count
-        - Click 'Measure intensities' to compute per-cell min/max/mean fluorescence (excluding zeros)
+        Single-image-layer Cell Counter:
+
+        - User selects exactly ONE layer from main viewer.
+        - Cell Counter viewer gets exactly ONE Image layer:
+            name = "Detection input - <selected layer name>"
+            colormap copied from that main viewer layer (supports hex string). 
+        - Shapes + Labels layers are added (these will always appear in layer list).
+        - State stores references so later code does not depend on layer names.
         """
         try:
             layer_names = [lyr.name for lyr in self.viewer.layers]
@@ -1688,21 +1854,21 @@ class UIWidget(QWidget):
                 QMessageBox.warning(self, "No layers", "No layers found in viewer.")
                 return
 
-            # --- checklist dialog ---
+            # --- dialog: select exactly ONE layer ---
             dlg = QDialog(self)
-            dlg.setWindowTitle("Cell counter: select layers")
+            dlg.setWindowTitle("Cell counter: select layer")
             dlg.setMinimumWidth(420)
             v = QVBoxLayout(dlg)
-            v.addWidget(QLabel("Check one or more layers to use for cell detection:"))
+            v.addWidget(QLabel("Select ONE layer to use for cell detection + intensity measurement:"))
 
             lst = QListWidget()
-            lst.setSelectionMode(QAbstractItemView.NoSelection)
+            lst.setSelectionMode(QAbstractItemView.SingleSelection)
             for nm in layer_names:
                 it = QListWidgetItem(nm)
-                it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
-                default_checked = nm.startswith("Channel ") and nm[8:].isdigit()
-                it.setCheckState(Qt.Checked if default_checked else Qt.Unchecked)
                 lst.addItem(it)
+                # preselect first "Channel <n>" if present
+                if lst.currentItem() is None and nm.startswith("Channel ") and nm[8:].isdigit():
+                    lst.setCurrentItem(it)
             v.addWidget(lst)
 
             buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -1713,33 +1879,62 @@ class UIWidget(QWidget):
             if dlg.exec() != QDialog.Accepted:
                 return
 
-            selected = [lst.item(i).text() for i in range(lst.count())
-                        if lst.item(i).checkState() == Qt.Checked]
-            if not selected:
-                QMessageBox.information(self, "Cell Counter", "No layers selected.")
+            item = lst.currentItem()
+            if item is None:
+                QMessageBox.information(self, "Cell Counter", "No layer selected.")
                 return
 
-            # --- build 3D stack (combine selected layers) ---
-            stacks = []
-            for nm in selected:
-                s3 = self._resolve_stack3d(nm)
-                if s3 is None:
-                    QMessageBox.warning(self, "Missing data", f"Could not resolve stack for: {nm}")
-                    return
-                s3 = np.asarray(s3)
-                if s3.ndim != 3:
-                    QMessageBox.warning(self, "Unsupported", f"{nm} is not 3D (shape {s3.shape}).")
-                    return
-                stacks.append(s3.astype(np.float32))
+            selected_name = item.text()
 
-            vol = np.max(np.stack(stacks, axis=0), axis=0)  # (Z,Y,X)
+            # Grab the actual layer object (better than re-looking-up later)
+            try:
+                src_layer = self.viewer.layers[selected_name]
+            except Exception:
+                src_layer = None
+
+            # Resolve 3D stack from that layer
+            s3 = self._resolve_stack3d(selected_name)
+            if s3 is None:
+                QMessageBox.warning(self, "Missing data", f"Could not resolve stack for: {selected_name}")
+                return
+
+            vol = np.asarray(s3, dtype=np.float32)
+            if vol.ndim != 3:
+                QMessageBox.warning(self, "Unsupported", f"{selected_name} is not 3D (shape {vol.shape}).")
+                return
+
+            # Pull the EXACT current colormap from the main UI layer.
+            # In your UI, you set lyr.colormap = "#RRGGBB", which napari supports.
+            cmap_arg = "gray"
+            if src_layer is not None:
+                cm = getattr(src_layer, "colormap", None)
+                if isinstance(cm, str) and cm:
+                    cmap_arg = cm  # includes hex strings like "#00ff00" 
+                elif isinstance(cm, tuple) and len(cm) >= 2 and isinstance(cm[0], str):
+                    cmap_arg = (cm[0], cm[1])  # (name, Colormap) 
 
             # --- create cell-counter viewer ---
             cc = napari.Viewer()
             cc.title = "Cell Counter"
-            cc.add_image(vol, name="Detection input", colormap="gray")
 
-            # IMPORTANT: Shapes layers must be 3D so ROIs are slice-locked (store z,y,x) [web:3]
+            detection_layer_name = f"Detection input - {selected_name}"
+            det_layer = cc.add_image(
+                vol,
+                name=detection_layer_name,
+                colormap=cmap_arg,
+                blending="additive",
+                opacity=1.0,
+            )
+
+            # Scale bar
+            cc.scale_bar.visible = True
+            cc.scale_bar.unit = "um"
+            cc.scale_bar.font_size = 12
+            cc.scale_bar.color = "white"
+            cc.scale_bar.box = True
+            cc.scale_bar.position = "bottom_right"
+
+            # Shapes (3D)
             pos_shapes = cc.add_shapes(
                 name="Cell body examples",
                 opacity=0.7,
@@ -1755,20 +1950,22 @@ class UIWidget(QWidget):
                 face_color="transparent",
             )
 
-            # Output labels layer placeholder
+            # Labels
             labels_layer = cc.add_labels(np.zeros(vol.shape, dtype=np.int32), name="Detected cells")
             labels_layer.visible = True
 
-            # store refs so detection + intensity measurement can see them
+            # Store refs so downstream code works even if user renames layers
             self._cell_counter_state = dict(
                 viewer=cc,
                 vol=vol,
+                detection_layer=det_layer,         # <- use this for intensity export defaults if desired
+                source_main_layer=src_layer,       # <- so you can re-pull colormap later if you want
                 pos_shapes=pos_shapes,
                 neg_shapes=neg_shapes,
                 labels=labels_layer,
             )
 
-            # --- helper: promote any accidentally-2D shapes to 3D using current z ---
+            # Promote accidentally-2D shapes to 3D (slice-locked)
             def _promote_shapes_to_3d(layer, event=None):
                 try:
                     z_now = int(cc.dims.point[0]) if hasattr(cc, "dims") and len(cc.dims.point) > 0 else 0
@@ -1783,7 +1980,7 @@ class UIWidget(QWidget):
                         new_data.append(poly)
                         continue
                     if pts.shape[1] == 2:
-                        pts3 = np.c_[np.full(len(pts), z_now), pts]  # (y,x)->(z,y,x)
+                        pts3 = np.c_[np.full(len(pts), z_now), pts]
                         new_data.append(pts3)
                         changed = True
                     else:
@@ -1801,15 +1998,13 @@ class UIWidget(QWidget):
             except Exception:
                 pass
 
-            # --- dock widget controls ---
+            # Dock controls
             w = QWidget()
             layout = QVBoxLayout(w)
-
             layout.addWidget(QLabel("1) Draw GREEN polygons around cell bodies (on the correct Z slice)."))
             layout.addWidget(QLabel("2) Draw RED polygons over neurites/junk/background to exclude."))
             layout.addWidget(QLabel("3) Run detection to segment + count; then measure intensities."))
 
-            # Threshold
             th_row = QHBoxLayout()
             th_row.addWidget(QLabel("Threshold (0–1)"))
             th = QSlider(Qt.Horizontal)
@@ -1828,7 +2023,6 @@ class UIWidget(QWidget):
 
             th.valueChanged.connect(_sync_th)
 
-            # Min voxels (volume filter)
             minvox_row = QHBoxLayout()
             minvox_row.addWidget(QLabel("Min voxels"))
             minvox = QSpinBox()
@@ -1837,16 +2031,14 @@ class UIWidget(QWidget):
             minvox_row.addWidget(minvox)
             layout.addLayout(minvox_row)
 
-            # Max voxels (reject huge connected networks)
             maxvox_row = QHBoxLayout()
             maxvox_row.addWidget(QLabel("Max voxels"))
             maxvox = QSpinBox()
             maxvox.setRange(0, 10_000_000)
-            maxvox.setValue(0)  # 0 = disabled
+            maxvox.setValue(0)
             maxvox_row.addWidget(maxvox)
             layout.addLayout(maxvox_row)
 
-            # Watershed compactness
             comp_row = QHBoxLayout()
             comp_row.addWidget(QLabel("Watershed compactness"))
             comp = QDoubleSpinBox()
@@ -1856,7 +2048,6 @@ class UIWidget(QWidget):
             comp_row.addWidget(comp)
             layout.addLayout(comp_row)
 
-            # Grow negative ROIs slightly
             neggrow_row = QHBoxLayout()
             neggrow_row.addWidget(QLabel("Neg ROI grow (px)"))
             neg_grow = QSpinBox()
@@ -1873,9 +2064,7 @@ class UIWidget(QWidget):
 
             ss_btn = QPushButton("Save Screenshot")
             ss_btn.clicked.connect(
-                lambda _=False: self.save_screenshot(
-                    viewer=cc, parent=self, default_name="cell_counter.png", canvas_only=True
-                )
+                lambda _=False: self.save_screenshot(viewer=cc, parent=self, default_name="cell_counter.png", canvas_only=True)
             )
             layout.addWidget(ss_btn)
 
@@ -1892,7 +2081,6 @@ class UIWidget(QWidget):
                     neg_grow=int(neg_grow.value()),
                 )
             )
-
             measure_btn.clicked.connect(lambda _=False: self.calculate_intensities_per_cell())
 
             return
@@ -2025,17 +2213,14 @@ class UIWidget(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Cell detection failed:\n{e}")
 
-
     def calculate_intensities_per_cell(self):
         """
-        Export a CSV with per-cell fluorescence intensity stats from the ACTIVE image layer
+        Export a CSV with per-cell fluorescence intensity stats from a chosen 3D Image layer
         in the Cell Counter viewer (one channel at a time):
         - Cell # (1..N)
         - min (excluding zeros)
         - max (excluding zeros)
         - average (mean, excluding zeros)
-
-        Intensities are calculated across the full 3D mask for each cell label (Z,Y,X). [web:30]
         """
         try:
             st = getattr(self, "_cell_counter_state", None)
@@ -2045,7 +2230,7 @@ class UIWidget(QWidget):
 
             cc = st["viewer"]
             labels_layer = st["labels"]
-            lab = np.asarray(labels_layer.data)  # labels; 0=background [web:30]
+            lab = np.asarray(labels_layer.data)  # 0=background
 
             if lab.ndim != 3:
                 QMessageBox.warning(cc.window.qt_viewer, "Cell Counter", "Detected cells layer must be 3D.")
@@ -2056,30 +2241,78 @@ class UIWidget(QWidget):
                 QMessageBox.information(cc.window.qt_viewer, "Cell Counter", "No detected cells to export.")
                 return
 
-            # --- get ACTIVE layer as fluorescence image source ---
-            active = getattr(cc.layers, "selection", None)
-            active = getattr(active, "active", None)  # selection.active exists in napari LayerList [web:47]
-            if active is None:
-                QMessageBox.warning(cc.window.qt_viewer, "Cell Counter", "Select the fluorescence Image layer to measure.")
+            # ---------------------------------------------------------
+            # 1) Collect candidate intensity source layers (3D Images)
+            # ---------------------------------------------------------
+            candidates = []  # list of (name, layer)
+            for lyr in cc.layers:
+                # Must have data
+                if not hasattr(lyr, "data"):
+                    continue
+
+                # Never allow measuring intensities from the Labels layer itself
+                # (Labels are integer IDs per pixel/voxel) 
+                if lyr is labels_layer or lyr.__class__.__name__.lower() == "labels":
+                    continue
+
+                # Must be array-like and shape-match labels
+                try:
+                    arr = np.asarray(lyr.data)
+                except Exception:
+                    continue
+
+                # We only support 3D scalar volumes here
+                if arr.ndim != 3:
+                    continue
+                if arr.shape != lab.shape:
+                    continue
+
+                candidates.append((getattr(lyr, "name", "image"), lyr))
+
+            if not candidates:
+                QMessageBox.warning(
+                    cc.window.qt_viewer,
+                    "Cell Counter",
+                    "No valid 3D Image layers found that match the labels shape.\n"
+                    f"Labels shape: {lab.shape}\n\n"
+                    "Tip: In your Cell Counter viewer, ensure the fluorescence volume you want to measure\n"
+                    "is present as a 3D Image layer with the same (Z,Y,X) shape."
+                )
                 return
 
-            # Require an Image layer-like object with .data
-            if not hasattr(active, "data"):
-                QMessageBox.warning(cc.window.qt_viewer, "Cell Counter", "Active layer has no data; select an Image layer.")
+            # Default to 'Detection input' if present
+            names = [nm for nm, _ in candidates]
+            default_index = 0
+            if "Detection input" in names:
+                default_index = names.index("Detection input")
+
+            chosen_name, ok = QInputDialog.getItem(
+                cc.window.qt_viewer,
+                "Choose intensity layer",
+                "Select the 3D Image layer to measure intensities from:",
+                names,
+                default_index,
+                False
+            )
+            if not ok or not chosen_name:
                 return
 
-            vol = np.asarray(active.data, dtype=np.float32)
+            chosen_layer = dict(candidates)[chosen_name]
+            vol = np.asarray(chosen_layer.data, dtype=np.float32)
 
-            # Must match labels (3D, same shape)
+            # Final guard
             if vol.ndim != 3 or vol.shape != lab.shape:
                 QMessageBox.warning(
                     cc.window.qt_viewer,
                     "Cell Counter",
-                    f"Active image layer must be 3D and match labels shape.\n"
+                    f"Selected layer does not match labels shape.\n"
                     f"Image shape: {vol.shape}, Labels shape: {lab.shape}"
                 )
                 return
 
+            # ---------------------------------------------------------
+            # 2) Choose output file
+            # ---------------------------------------------------------
             base, ok = QInputDialog.getText(
                 cc.window.qt_viewer,
                 "CSV name",
@@ -2094,7 +2327,7 @@ class UIWidget(QWidget):
             save_path, _ = QFileDialog.getSaveFileName(
                 cc.window.qt_viewer,
                 "Save cell intensities CSV",
-                default_name,                 
+                default_name,
                 "CSV files (*.csv)"
             )
             if not save_path:
@@ -2102,7 +2335,9 @@ class UIWidget(QWidget):
             if not save_path.lower().endswith(".csv"):
                 save_path += ".csv"
 
-            # Compute per-cell stats across full 3D region; exclude zeros 
+            # ---------------------------------------------------------
+            # 3) Compute per-cell stats (exclude zeros)
+            # ---------------------------------------------------------
             rows = []
             for cell_id in range(1, n_cells + 1):
                 m = (lab == cell_id)
@@ -2110,7 +2345,7 @@ class UIWidget(QWidget):
                     continue
 
                 vals = vol[m]
-                vals = vals[vals > 0]  # exclude zero pixels from min/max/mean
+                vals = vals[vals > 0]  # exclude 0 background
 
                 if vals.size == 0:
                     min_v = float("nan")
@@ -2123,20 +2358,20 @@ class UIWidget(QWidget):
 
                 rows.append((cell_id, min_v, max_v, mean_v))
 
-            if len(rows) == 0:
+            if not rows:
                 QMessageBox.information(cc.window.qt_viewer, "Cell Counter", "No cells had non-zero intensity pixels.")
                 return
 
             with open(save_path, "w", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["Cell #", "min", "max", "average"])  
-                w.writerows(rows)                                 
+                w.writerow(["Cell #", "min", "max", "average"])
+                w.writerows(rows)
 
-            print(f"Exported intensities for {len(rows)} cells from layer '{getattr(active, 'name', 'active')}' to: {save_path}")
+            print(f"Exported intensities for {len(rows)} cells from layer '{chosen_name}' to: {save_path}")
             QMessageBox.information(
                 cc.window.qt_viewer,
                 "Cell Counter",
-                f"Exported {len(rows)} cells.\nLayer: {getattr(active, 'name', 'active')}\nSaved to:\n{save_path}"
+                f"Exported {len(rows)} cells.\nLayer: {chosen_name}\nSaved to:\n{save_path}"
             )
 
         except Exception as e:
@@ -2612,6 +2847,7 @@ class UIWidget(QWidget):
         except Exception:
             pass
         return False
+    
     def _resolve_stack3d(self, layer_name: str):
         """
         Return a full 3D stack (Z,Y,X) for any selectable layer name:
@@ -3019,7 +3255,7 @@ class UIWidget(QWidget):
             if suggested is None:
                 suggested = (1.0, 1.0, 1.0)
 
-            # Always prompt user (defaulting to suggested values) [web:183][web:187]
+            # Always prompt user (defaulting to suggested values) 
             z_um, ok1 = QInputDialog.getDouble(
                 self, "Voxel size", "Z voxel size (µm):", float(suggested[0]), 1e-6, 1e9, 6
             )
@@ -3349,7 +3585,7 @@ class UIWidget(QWidget):
                 return
 
             try:
-                img_layer = proj_viewer.layers[chosen_layer_name]  # napari supports indexing by unique name [web:54]
+                img_layer = proj_viewer.layers[chosen_layer_name]  # napari supports indexing by unique name 
             except Exception:
                 img_layer = None
 
@@ -3439,8 +3675,7 @@ class UIWidget(QWidget):
 
             # ----------------------------
             # 4) ROI processing
-            # ----------------------------
-            from skimage.draw import polygon2mask  # simpler + safer than manual rr/cc [web:15]
+            # ----------------------------  
 
             results = {}
             bg_values_for_row = {}
@@ -3481,7 +3716,7 @@ class UIWidget(QWidget):
                         poly = np.asarray(shape)
                         if poly.ndim != 2 or poly.shape[0] < 3:
                             continue
-                        # polygon2mask expects (row, col) coords [web:15]
+                        # polygon2mask expects (row, col) coords 
                         poly_rc = np.column_stack([poly[:, 0], poly[:, 1]])
                         m = polygon2mask((ydim, xdim), poly_rc)
                         mask2d |= m.astype(bool)
@@ -3767,11 +4002,6 @@ class UIWidget(QWidget):
 ###############################################################################
 
 def main():
-    import sys, os
-    from pathlib import Path
-
-    import napari
-    from qtpy.QtWidgets import QApplication, QFileDialog, QMessageBox
 
     # Ensure QApplication exists (only one per process).
     app = QApplication.instance()

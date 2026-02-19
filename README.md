@@ -85,8 +85,12 @@ Installation of packages
 
 ### Running of napari UI ###
 - In the now activated napari_env you can run the Napari user interface for analysis.
-# If you are using a windows machine then use the following command to start the user interface
+
+#If you are using a windows machine then use the following command to start the user interface
 - python Napari_UI.py
 
 #If you are using a mac machine then use the following command to star the user interface
 - python3.11 Napari_UI.py
+
+
+### C
