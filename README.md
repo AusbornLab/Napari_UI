@@ -23,12 +23,12 @@ brew install git
 
 ### Setup of python ###
 
-The current version of python that is used for this is 3.11.9.
+The current version of python that is used for this is 3.13.2.
 It has only been tested with this version, and therefore has dependcy requirements using this version. 
-Using Python 3.12+ or older packages may cause compatibility errors.
+Using Python versions prior to 3.13 (3.11 or older specifically may cause compatibility errors)
 
 Python can be downloaded from the following website
-https://www.python.org/downloads/release/python-3119/
+https://www.python.org/downloads/release/python-31312/
 
 
 ### Pulling the github repository
