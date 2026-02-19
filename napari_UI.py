@@ -5,16 +5,17 @@ import sys
 import os
 import time
 import napari
+import torch
 from datetime import datetime
 from pathlib import Path
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QCheckBox,
     QSlider, QGroupBox, QFileDialog, QApplication, QMessageBox, QProgressBar,
     QSpinBox, QDialog, QColorDialog, QSplitter, QListWidget, QAbstractItemView,
-    QListWidgetItem, QDialogButtonBox, QDoubleSpinBox, QInputDialog, QLineEdit
+    QListWidgetItem, QDialogButtonBox, QDoubleSpinBox, QInputDialog, QLineEdit, QComboBox, QScrollArea
 )
 from qtpy.QtCore import Qt
-
+from napari.qt.threading import thread_worker
 from skimage.filters import gaussian, threshold_otsu
 from skimage.morphology import remove_small_objects, closing, disk, dilation, ball, binary_opening
 from aicsimageio import AICSImage
@@ -32,6 +33,9 @@ import re
 import xml.etree.ElementTree as ET
 from skimage.morphology import disk, dilation, remove_small_objects
 from skimage.feature import peak_local_max
+from cellpose import models, train
+from cellpose import io as cellpose_io
+
 
 
 
@@ -1835,14 +1839,14 @@ class UIWidget(QWidget):
 
     def open_cell_counter(self):
         """
-        Single-image-layer Cell Counter:
+        Single-image-layer Cell Counter with two detection backends:
+        - Classic (threshold/cleanup/watershed) for mask generation
+        - ML (Cellpose train/load/infer), optional
 
-        - User selects exactly ONE layer from main viewer.
-        - Cell Counter viewer gets exactly ONE Image layer:
-            name = "Detection input - <selected layer name>"
-            colormap copied from that main viewer layer (supports hex string).
-        - Shapes + Labels layers are added.
-        - State stores references so later code does not depend on layer names.
+        Intended workflow:
+        A) Manual detection + mask generation (Classic + label editing)
+        B) ML (train/infer) using the curated labels mask
+        C) Analysis (measure intensities, screenshots)
         """
         try:
             layer_names = [lyr.name for lyr in self.viewer.layers]
@@ -1930,14 +1934,14 @@ class UIWidget(QWidget):
 
             # Shapes (3D)
             pos_shapes = cc.add_shapes(
-                name="Cell body examples",
+                name="Positive ROIs (seed somas)",
                 opacity=0.7,
                 ndim=3,
                 edge_color="lime",
                 face_color="transparent",
             )
             neg_shapes = cc.add_shapes(
-                name="Not cell body",
+                name="Negative ROIs (exclude junk)",
                 opacity=0.7,
                 ndim=3,
                 edge_color="red",
@@ -1945,10 +1949,10 @@ class UIWidget(QWidget):
             )
 
             # Labels
-            labels_layer = cc.add_labels(np.zeros(vol.shape, dtype=np.int32), name="Detected cells")
+            labels_layer = cc.add_labels(np.zeros(vol.shape, dtype=np.int32), name="Detected cells (labels mask)")
             labels_layer.visible = True
 
-            # Store refs
+            # Store refs (add ML fields)
             self._cell_counter_state = dict(
                 viewer=cc,
                 vol=vol,
@@ -1957,6 +1961,11 @@ class UIWidget(QWidget):
                 pos_shapes=pos_shapes,
                 neg_shapes=neg_shapes,
                 labels=labels_layer,
+                # ML state:
+                ml_backend="none",          # "none" | "cellpose" | "stardist" | "custom"
+                ml_model_path="",           # where weights/config live
+                ml_device=self._torch_best_device(),
+                status_label=None,
             )
 
             # Promote accidentally-2D shapes to 3D (slice-locked)
@@ -1992,12 +2001,24 @@ class UIWidget(QWidget):
             except Exception:
                 pass
 
-            # Dock controls
-            w = QWidget()
-            layout = QVBoxLayout(w)
-            layout.addWidget(QLabel("1) Draw GREEN polygons around cell bodies (on the correct Z slice)."))
-            layout.addWidget(QLabel("2) Draw RED polygons over neurites/junk/background to exclude."))
-            layout.addWidget(QLabel("3) Run detection to segment + count; then measure intensities."))
+            # ---------------- Dock controls (reorganized) ----------------
+            container = QWidget()
+            layout = QVBoxLayout(container)
+            layout.setContentsMargins(6, 6, 6, 6)
+            layout.setSpacing(6)
+
+
+            # Status line (top)
+            status = QLabel(f"Device: {self._cell_counter_state['ml_device']} | Backend: (none)")
+            layout.addWidget(status)
+            self._cell_counter_state["status_label"] = status
+
+            # ===== Section A: Manual detection / mask generation =====
+            layout.addWidget(QLabel("Manual detection + mask generation (Classic)"))
+
+            layout.addWidget(QLabel("Step 1: Draw GREEN ROIs on somas (seeds) and RED ROIs on junk to exclude."))
+            layout.addWidget(QLabel("Step 2: Click 'Generate/Update labels mask (Classic)'."))
+            layout.addWidget(QLabel("Step 3: Manually edit 'Detected cells (labels mask)' if needed (this mask trains ML)."))
 
             # Threshold
             th_row = QHBoxLayout()
@@ -2055,7 +2076,7 @@ class UIWidget(QWidget):
             neggrow_row.addWidget(neg_grow)
             layout.addLayout(neggrow_row)
 
-            # --- NEW: smoothing ---
+            # Smoothing
             gs_row = QHBoxLayout()
             gs_row.addWidget(QLabel("Gaussian sigma (0=off)"))
             gs = QDoubleSpinBox()
@@ -2065,7 +2086,7 @@ class UIWidget(QWidget):
             gs_row.addWidget(gs)
             layout.addLayout(gs_row)
 
-            # --- NEW: soma opening ---
+            # Soma opening
             open_row = QHBoxLayout()
             open_row.addWidget(QLabel("Soma opening radius (px)"))
             open_r = QSpinBox()
@@ -2074,12 +2095,10 @@ class UIWidget(QWidget):
             open_row.addWidget(open_r)
             layout.addLayout(open_row)
 
-            # --- NEW: auto-split ---
-            split_row = QHBoxLayout()
+            # Auto-split
             auto_split = QCheckBox("Auto-split touching cells (distance peaks)")
             auto_split.setChecked(True)
-            split_row.addWidget(auto_split)
-            layout.addLayout(split_row)
+            layout.addWidget(auto_split)
 
             seed_row = QHBoxLayout()
             seed_row.addWidget(QLabel("Min seed distance (px)"))
@@ -2089,8 +2108,115 @@ class UIWidget(QWidget):
             seed_row.addWidget(seed_dist)
             layout.addLayout(seed_row)
 
-            run_btn = QPushButton("Run detection + count cells")
-            layout.addWidget(run_btn)
+            # Manual/classic run button (renamed to clarify purpose)
+            classic_btn = QPushButton("Generate/Update labels mask (Classic)")
+            layout.addWidget(classic_btn)
+
+            def _run_classic():
+                self._cell_counter_set_status("Backend: classic | Generating labels...")
+                self._cell_counter_run_detection(
+                    threshold=float(th.value()) / 100.0,
+                    min_voxels=int(minvox.value()),
+                    max_voxels=int(maxvox.value()),
+                    compactness=float(comp.value()),
+                    neg_grow=int(neg_grow.value()),
+                    gaussian_sigma=float(gs.value()),
+                    open_radius=int(open_r.value()),
+                    auto_split=bool(auto_split.isChecked()),
+                    min_seed_distance=int(seed_dist.value()),
+                )
+                # _cell_counter_run_detection already shows a QMessageBox; keep status updated anyway
+                self._cell_counter_set_status("Backend: classic | Labels updated")
+
+            classic_btn.clicked.connect(lambda _=False: _run_classic())
+
+            # ===== Section B: ML (Cellpose) =====
+            layout.addWidget(QLabel("ML model (Cellpose): train / load / infer (uses labels mask)"))
+
+            layout.addWidget(QLabel("Train uses the current 'Detected cells (labels mask)' (0=bg, 1..N instances)."))
+
+            ml_backend_row = QHBoxLayout()
+            ml_backend_row.addWidget(QLabel("ML backend"))
+            ml_backend = QComboBox()
+            ml_backend.addItems(["Cellpose (recommended)"])  # keep focused until other backends implemented
+            ml_backend_row.addWidget(ml_backend)
+            layout.addLayout(ml_backend_row)
+
+            device_row = QHBoxLayout()
+            device_row.addWidget(QLabel("Compute device"))
+            device = QComboBox()
+            device.addItems(["auto", "cuda", "mps", "cpu"])
+            device.setCurrentIndex(0)
+            device_row.addWidget(device)
+            layout.addLayout(device_row)
+
+            model_path_row = QHBoxLayout()
+            model_path_row.addWidget(QLabel("Model path"))
+            model_path = QLineEdit("")
+            model_path_row.addWidget(model_path)
+            browse_btn = QPushButton("Browse")
+            model_path_row.addWidget(browse_btn)
+            layout.addLayout(model_path_row)
+
+            def _browse_model():
+                pth = QFileDialog.getExistingDirectory(cc.window.qt_viewer, "Select model folder")
+                if pth:
+                    model_path.setText(pth)
+
+            browse_btn.clicked.connect(_browse_model)
+
+            load_btn = QPushButton("Load model / weights")
+            train_btn = QPushButton("Train Cellpose from labels mask (manual-first)")
+            infer_btn = QPushButton("Run Cellpose inference → write labels mask")
+            save_btn = QPushButton("Save model / weights")
+
+            layout.addWidget(load_btn)
+            layout.addWidget(train_btn)
+            layout.addWidget(infer_btn)
+            layout.addWidget(save_btn)
+
+            # --- ML progress UI (dock-local, in addition to napari's global progress) ---
+            ml_prog_label = QLabel("ML progress: idle")
+            ml_prog_bar = QProgressBar()
+            ml_prog_bar.setRange(0, 100)
+            ml_prog_bar.setValue(0)
+            ml_prog_bar.setTextVisible(True)
+
+            layout.addWidget(ml_prog_label)
+            layout.addWidget(ml_prog_bar)
+
+            cancel_btn = QPushButton("Cancel training")
+            layout.addWidget(cancel_btn)
+            cancel_btn.clicked.connect(lambda _=False: self._cell_counter_ml_cancel())
+
+            self._cell_counter_state["ml_progress_label"] = ml_prog_label
+            self._cell_counter_state["ml_progress_bar"] = ml_prog_bar
+            self._cell_counter_state["ml_worker"] = None
+            self._cell_counter_state["ml_cancel_flag"] = False
+
+            load_btn.clicked.connect(lambda _=False: self._cell_counter_ml_load(
+                backend=str(ml_backend.currentText()),
+                device=str(device.currentText()),
+                model_path=str(model_path.text()).strip(),
+            ))
+            train_btn.clicked.connect(lambda _=False: self._cell_counter_ml_train_threaded(
+            backend=str(ml_backend.currentText()),
+            device=str(device.currentText()),
+            model_path=str(model_path.text()).strip(),
+            ))
+            infer_btn.clicked.connect(lambda _=False: self._cell_counter_ml_infer(
+                backend=str(ml_backend.currentText()),
+                device=str(device.currentText()),
+                model_path=str(model_path.text()).strip(),
+            ))
+            save_btn.clicked.connect(lambda _=False: self._cell_counter_ml_save(
+                backend=str(ml_backend.currentText()),
+                device=str(device.currentText()),
+                model_path=str(model_path.text()).strip(),
+            ))
+
+            # ===== Section C: Analysis / export =====
+            layout.addWidget(QLabel("Analysis / export"))
 
             measure_btn = QPushButton("Measure intensities per cell (min/max/mean; exclude zeros)")
             layout.addWidget(measure_btn)
@@ -2103,29 +2229,722 @@ class UIWidget(QWidget):
             )
             layout.addWidget(ss_btn)
 
-            layout.addStretch(1)
-            w.setLayout(layout)
-            cc.window.add_dock_widget(w, area="right")
-
-            run_btn.clicked.connect(
-                lambda _=False: self._cell_counter_run_detection(
-                    threshold=float(th.value()) / 100.0,
-                    min_voxels=int(minvox.value()),
-                    max_voxels=int(maxvox.value()),
-                    compactness=float(comp.value()),
-                    neg_grow=int(neg_grow.value()),
-                    gaussian_sigma=float(gs.value()),
-                    open_radius=int(open_r.value()),
-                    auto_split=bool(auto_split.isChecked()),
-                    min_seed_distance=int(seed_dist.value()),
-                )
-            )
             measure_btn.clicked.connect(lambda _=False: self.calculate_intensities_per_cell())
+
+            layout.addStretch(1)
+            container.setLayout(layout)
+
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(container)
+
+            cc.window.add_dock_widget(scroll, area="right")
             return
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open cell counter:\n{e}")
 
+    def _fmt_hms(self, sec: float) -> str:
+        sec = int(max(0, sec))
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        s = sec % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    def _cell_counter_ml_cancel(self):
+        st = getattr(self, "_cell_counter_state", None)
+        if not st:
+            return
+        st["ml_cancel_flag"] = True
+        # request abort from napari worker too (works only if worker yields/checks abort_requested)
+        wk = st.get("ml_worker", None)
+        if wk is not None:
+            try:
+                wk.quit()
+            except Exception:
+                pass
+        self._ml_ui_set_progress("ML progress: cancel requested...", None)
+
+    def _ml_ui_set_progress(self, text: str = None, pct: int = None):
+        st = getattr(self, "_cell_counter_state", None)
+        if not st:
+            return
+        lab = st.get("ml_progress_label", None)
+        bar = st.get("ml_progress_bar", None)
+        if text is not None and lab is not None:
+            try:
+                lab.setText(text)
+            except Exception:
+                pass
+        if pct is not None and bar is not None:
+            try:
+                bar.setValue(int(np.clip(pct, 0, 100)))
+            except Exception:
+                pass
+    
+    def _cell_counter_ml_train_threaded(self, backend="Cellpose (recommended)", device="auto", model_path=""):
+        st = getattr(self, "_cell_counter_state", None)
+        if not st:
+            QMessageBox.warning(self, "ML", "No cell-counter session found.")
+            return
+
+        if st.get("ml_worker", None) is not None:
+            QMessageBox.information(self, "ML", "Training is already running.")
+            return
+
+        model_path = (model_path or "").strip()
+        if not model_path:
+            cc = st.get("viewer", None)
+            parent = cc.window._qt_window if hasattr(cc.window, "_qt_window") else None  # avoids qt_viewer deprecation
+            QMessageBox.warning(parent or self, "ML", "Please choose a Model path before training.")
+            return
+
+        # Collect hyperparameters on UI thread (mac-safe)
+        cc = st["viewer"]
+        model_name, ok = QInputDialog.getText(
+            cc.window._qt_window if hasattr(cc.window, "_qt_window") else None,
+            "Cellpose model name",
+            "Enter a name for the trained model:",
+            text=f"cellpose_custom_{time.strftime('%Y%m%d_%H%M%S')}",
+        )
+        if not ok:
+            return
+        model_name = (model_name or "").strip() or f"cellpose_custom_{time.strftime('%Y%m%d_%H%M%S')}"
+
+        n_epochs, ok = QInputDialog.getInt(
+            cc.window._qt_window if hasattr(cc.window, "_qt_window") else None,
+            "Epochs",
+            "Number of training epochs:",
+            value=50, min=1, max=5000
+        )
+        if not ok:
+            return
+
+        lr, ok = QInputDialog.getDouble(
+            cc.window._qt_window if hasattr(cc.window, "_qt_window") else None,
+            "Learning rate",
+            "Learning rate:",
+            value=1e-5, min=1e-7, max=1e-2, decimals=8
+        )
+        if not ok:
+            return
+
+        wd, ok = QInputDialog.getDouble(
+            cc.window._qt_window if hasattr(cc.window, "_qt_window") else None,
+            "Weight decay",
+            "Weight decay:",
+            value=0.1, min=0.0, max=10.0, decimals=6
+        )
+        if not ok:
+            return
+
+        st["ml_cancel_flag"] = False
+        self._ml_ui_set_progress("ML progress: starting...", 0)
+        self._cell_counter_set_status("Backend: cellpose | Starting training...")
+
+        worker = self._cellpose_train_worker(
+            backend=backend,
+            device=device,
+            model_path=model_path,
+            model_name=model_name,
+            n_epochs=int(n_epochs),
+            lr=float(lr),
+            wd=float(wd),
+            start_model="cpsam",
+        )
+
+        worker.yielded.connect(self._on_cellpose_train_yielded)
+        worker.returned.connect(self._on_cellpose_train_returned)
+        worker.errored.connect(self._on_cellpose_train_errored)
+        worker.finished.connect(self._on_cellpose_train_finished)
+
+        st["ml_worker"] = worker
+        worker.start()
+
+
+    @thread_worker(progress={"desc": "Cellpose training"})  # omit total => indeterminate is fine
+    def _cellpose_train_worker(
+        self,
+        backend="Cellpose (recommended)",
+        device="auto",
+        model_path="",
+        model_name="cellpose_custom",
+        n_epochs=50,
+        lr=1e-5,
+        wd=0.1,
+        start_model="cpsam",
+    ):
+        t0 = time.time()
+        yield {"pct": 0, "msg": "Validating session..."}
+
+        st = getattr(self, "_cell_counter_state", None)
+        if not st:
+            raise RuntimeError("No cell-counter session found.")
+        if "Cellpose" not in (backend or ""):
+            raise RuntimeError("Only Cellpose backend is implemented right now.")
+
+        model_path = (model_path or "").strip()
+        if not model_path:
+            raise RuntimeError("Model path is empty. Choose a model folder first.")
+        os.makedirs(model_path, exist_ok=True)
+
+        # Device
+        dev = self._torch_best_device() if (device == "auto") else self._cellpose_device_from_ui(device)
+
+        # Pull data
+        vol = np.asarray(st["vol"], dtype=np.float32)        # (Z,Y,X)
+        labels_layer = st["labels"]
+        lab3d = np.asarray(labels_layer.data, dtype=np.int32)
+
+        # Manual-first: require labels to exist (recommended)
+        if int(lab3d.max()) <= 0:
+            raise RuntimeError("No labels available. Generate/Edit 'Detected cells (labels mask)' first, then train.")
+
+        yield {"pct": 10, "msg": "Building 2D training set..."}
+
+        train_imgs, train_masks = self._cell_counter_build_cellpose_training_set(
+            vol3d=vol,
+            labels3d=lab3d,
+            max_slices=64,
+            min_masks_per_slice=1,
+        )
+        if not train_imgs:
+            raise RuntimeError("No labeled Z-slices found to train on.")
+
+        # Early cancel point (works)
+        if getattr(self, "_cell_counter_state", {}).get("ml_cancel_flag", False):
+            raise RuntimeError("Training cancelled before model init.")
+
+        yield {"pct": 20, "msg": f"Init Cellpose model ({start_model}) on {dev}..."}
+
+        try:
+            cellpose_io.logger_setup()
+        except Exception:
+            pass
+
+        try:
+            import torch
+            device_obj = torch.device(dev)
+        except Exception:
+            device_obj = None
+
+        gpu_flag = (dev == "cuda" or dev == "mps")
+        # This triggers model download on first use if needed
+        model = models.CellposeModel(gpu=gpu_flag, device=device_obj, pretrained_model=str(start_model))
+
+        yield {"pct": 30, "msg": f"Training... elapsed {self._fmt_hms(time.time()-t0)} (epochs={int(n_epochs)})"}
+
+        # After this point we cannot cancel cleanly until train_seg returns.
+        model_out_path, train_losses, test_losses = train.train_seg(
+            model.net,
+            train_data=train_imgs,
+            train_labels=train_masks,
+            test_data=None,
+            test_labels=None,
+            weight_decay=float(wd),
+            learning_rate=float(lr),
+            n_epochs=int(n_epochs),
+            model_name=str(model_name),
+        )
+
+        meta = dict(
+            backend="cellpose",
+            pretrained_start=str(start_model),
+            device=str(dev),
+            model_name=str(model_name),
+            model_out_path=str(model_out_path),
+            n_train_images=len(train_imgs),
+            n_epochs=int(n_epochs),
+            learning_rate=float(lr),
+            weight_decay=float(wd),
+            created=time.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        with open(os.path.join(model_path, "cellpose_model_meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+
+        yield {"pct": 100, "msg": f"Done in {self._fmt_hms(time.time()-t0)} | saved: {model_out_path}"}
+        return dict(
+            model_out_path=str(model_out_path),
+            model_name=str(model_name),
+            meta_path=os.path.join(model_path, "cellpose_model_meta.json"),
+        )
+
+
+    def _on_cellpose_train_yielded(self, payload):
+        # payload is dict: {"pct": int, "msg": str}
+        try:
+            msg = str(payload.get("msg", ""))
+            pct = payload.get("pct", None)
+        except Exception:
+            msg, pct = str(payload), None
+
+        if msg:
+            print(f"[Cellpose] {msg}", flush=True)
+            self._cell_counter_set_status(msg)
+            self._ml_ui_set_progress("ML progress: ", None)
+
+        if pct is not None:
+            self._ml_ui_set_progress(None, int(pct))
+
+    def _on_cellpose_train_returned(self, result):
+        st = getattr(self, "_cell_counter_state", None)
+        if not st:
+            return
+        try:
+            st["ml_last_trained_model_file"] = result.get("model_out_path", "")
+            st["ml_model_path"] = os.path.dirname(result.get("meta_path", "")) if result.get("meta_path", "") else st.get("ml_model_path", "")
+            st["ml_backend"] = "cellpose"
+        except Exception:
+            pass
+
+        self._cell_counter_set_status("Backend: cellpose | Training complete")
+        self._ml_ui_set_progress("ML progress: complete", 100)
+
+        try:
+            cc = st["viewer"]
+            QMessageBox.information(
+                cc.window.qt_viewer,
+                "ML",
+                f"Training complete.\nModel: {st.get('ml_last_trained_model_file','')}",
+            )
+        except Exception:
+            pass
+
+    def _on_cellpose_train_errored(self, err):
+        self._cell_counter_set_status("Backend: cellpose | Training failed")
+        self._ml_ui_set_progress(f"ML progress: error: {err}", 0)
+
+        st = getattr(self, "_cell_counter_state", None)
+        try:
+            cc = st["viewer"] if st else None
+            parent = cc.window.qt_viewer if cc is not None else self
+            QMessageBox.critical(parent, "ML", f"Cellpose training failed:\n{err}")
+        except Exception:
+            pass
+
+    def _on_cellpose_train_finished(self):
+        st = getattr(self, "_cell_counter_state", None)
+        if st:
+            st["ml_worker"] = None
+
+
+    def _cell_counter_ml_load(self, backend="Cellpose (recommended)", device="auto", model_path=""):
+        st = getattr(self, "_cell_counter_state", None)
+        if not st:
+            return
+        if device == "auto":
+            device = self._torch_best_device()
+        st["ml_device"] = device
+        st["ml_model_path"] = model_path
+        st["ml_backend"] = "cellpose" if "Cellpose" in backend else "stardist" if "StarDist" in backend else "custom"
+        self._cell_counter_set_status(f"Device: {device} | Backend: {st['ml_backend']} | Model: {model_path or '(none)'}")
+
+    def _cell_counter_ml_save(self, backend="Cellpose (recommended)", device="auto", model_path=""):
+        QMessageBox.information(self, "ML", "Save is wired, but training/inference implementation is not added yet.")
+
+    def _cell_counter_ml_train(self, backend="Cellpose (recommended)", device="auto", model_path=""):
+        QMessageBox.information(self, "ML", "Train is wired, but training implementation is not added yet.")
+
+    def _cell_counter_ml_infer(self, backend="Cellpose (recommended)", device="auto", model_path=""):
+        QMessageBox.information(self, "ML", "Inference is wired, but inference implementation is not added yet.")
+
+    def _torch_best_device(self):
+        """Return a torch.device string: 'cuda' | 'mps' | 'cpu'."""
+        try:
+            if torch.cuda.is_available():
+                return "cuda"
+            mps_ok = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+            if mps_ok:
+                return "mps"
+            return "cpu"
+        except Exception:
+            return "cpu"
+    
+    def _cellpose_device_from_ui(self, device_choice: str):
+        """
+        Map UI 'auto|cuda|mps|cpu' to a torch.device-like string for Cellpose.
+        Cellpose accepts either gpu=True or an explicit device in newer APIs;
+        we keep it simple and pass a device string into CellposeModel where possible.
+        """
+        dc = (device_choice or "auto").strip().lower()
+        if dc == "auto":
+            return self._torch_best_device()
+        if dc in ("cuda", "mps", "cpu"):
+            return dc
+        return self._torch_best_device()
+    
+    def _cell_counter_build_cellpose_training_set(self, vol3d: np.ndarray, labels3d: np.ndarray,
+                                             max_slices: int = 64,
+                                             min_masks_per_slice: int = 1):
+        """
+        Build 2D training data for Cellpose from a 3D stack.
+        Returns (train_images, train_masks) where each is a list of 2D arrays.
+
+        Strategy:
+        - Use Z slices where labels3d has at least `min_masks_per_slice` instances.
+        - Subsample up to `max_slices` slices to keep training time reasonable.
+        """
+        assert vol3d.ndim == 3 and labels3d.ndim == 3
+        Z = vol3d.shape[0]
+
+        slice_ids = []
+        for z in range(Z):
+            lab2 = labels3d[z]
+            n_inst = int(lab2.max())
+            if n_inst >= int(min_masks_per_slice):
+                slice_ids.append(z)
+
+        if not slice_ids:
+            return [], []
+
+        # Subsample evenly if too many
+        if len(slice_ids) > int(max_slices):
+            idx = np.linspace(0, len(slice_ids) - 1, int(max_slices)).round().astype(int)
+            slice_ids = [slice_ids[i] for i in idx]
+
+        imgs = []
+        masks = []
+        for z in slice_ids:
+            img2 = np.asarray(vol3d[z], dtype=np.float32)
+            m2 = np.asarray(labels3d[z], dtype=np.int32)
+            imgs.append(img2)
+            masks.append(m2)
+
+        return imgs, masks
+
+    def _cell_counter_ml_train(self, backend="Cellpose (recommended)", device="auto", model_path=""):
+        try:
+            st = getattr(self, "_cell_counter_state", None)
+            if not st:
+                QMessageBox.warning(self, "ML", "No cell-counter session found.")
+                return
+
+            if "Cellpose" not in (backend or ""):
+                QMessageBox.warning(self, "ML", "Only Cellpose backend is implemented right now.")
+                return
+
+            cc = st["viewer"]
+            vol = np.asarray(st["vol"], dtype=np.float32)  # (Z,Y,X)
+            labels_layer = st["labels"]
+
+            # Choose / create model output directory
+            if not model_path:
+                model_path = QFileDialog.getExistingDirectory(cc.window.qt_viewer, "Select folder to save model")
+                if not model_path:
+                    return
+            os.makedirs(model_path, exist_ok=True)
+
+            # Determine device
+            dev = self._cellpose_device_from_ui(device)
+            st["ml_device"] = dev
+            st["ml_backend"] = "cellpose"
+            st["ml_model_path"] = model_path
+            self._cell_counter_set_status(f"Device: {dev} | Backend: cellpose | Training...")
+
+            # Ensure we have labels to train on: use existing labels if present,
+            # otherwise generate pseudo-labels via classic detection first.
+            lab3d = np.asarray(labels_layer.data, dtype=np.int32)
+            if int(lab3d.max()) <= 0:
+                # Run classic detection with conservative defaults (you can tune these)
+                self._cell_counter_run_detection(
+                    threshold=0.50,
+                    min_voxels=200,
+                    max_voxels=0,
+                    compactness=0.0,
+                    neg_grow=2,
+                    gaussian_sigma=1.0,
+                    open_radius=1,
+                    auto_split=True,
+                    min_seed_distance=8,
+                )
+                lab3d = np.asarray(labels_layer.data, dtype=np.int32)
+
+            if int(lab3d.max()) <= 0:
+                QMessageBox.warning(cc.window.qt_viewer, "ML", "No labels available for training (Detected cells is empty).")
+                self._cell_counter_set_status(f"Device: {dev} | Backend: cellpose | Training failed")
+                return
+
+            # Build 2D training set from labeled slices
+            train_imgs, train_masks = self._cell_counter_build_cellpose_training_set(
+                vol3d=vol,
+                labels3d=lab3d,
+                max_slices=64,
+                min_masks_per_slice=1,
+            )
+            if not train_imgs:
+                QMessageBox.warning(cc.window.qt_viewer, "ML", "No labeled Z-slices found to train on.")
+                self._cell_counter_set_status(f"Device: {dev} | Backend: cellpose | Training failed")
+                return
+
+            # Ask for training hyperparameters
+            model_name, ok = QInputDialog.getText(
+                cc.window.qt_viewer,
+                "Cellpose model name",
+                "Enter a name for the trained model:",
+                text=f"cellpose_custom_{time.strftime('%Y%m%d_%H%M%S')}",
+            )
+            if not ok:
+                return
+            model_name = (model_name or "").strip() or f"cellpose_custom_{time.strftime('%Y%m%d_%H%M%S')}"
+
+            n_epochs, ok = QInputDialog.getInt(
+                cc.window.qt_viewer, "Epochs", "Number of training epochs:", value=50, min=1, max=5000
+            )
+            if not ok:
+                return
+
+            lr, ok = QInputDialog.getDouble(
+                cc.window.qt_viewer, "Learning rate", "Learning rate:", value=1e-5, min=1e-7, max=1e-2, decimals=8
+            )
+            if not ok:
+                return
+
+            wd, ok = QInputDialog.getDouble(
+                cc.window.qt_viewer, "Weight decay", "Weight decay:", value=0.1, min=0.0, max=10.0, decimals=6
+            )
+            if not ok:
+                return
+
+            # Cellpose logger setup (optional)
+            try:
+                cellpose_io.logger_setup()
+            except Exception:
+                pass
+
+            # Create a Cellpose model starting from built-in pretrained (recommended by Cellpose docs). [page:1]
+            # We try to pass an explicit device if available; otherwise rely on gpu flag.
+            # Cellpose's internal device assignment supports CUDA and checks MPS availability. [web:479]
+            try:
+                import torch
+                device_obj = torch.device(dev)
+            except Exception:
+                device_obj = None
+
+            gpu_flag = (dev == "cuda" or dev == "mps")
+            model = models.CellposeModel(gpu=gpu_flag, device=device_obj, pretrained_model="cpsam")
+
+            # Train and save model
+            # train.train_seg returns model_path and losses per docs. [page:1]
+            model_out_path, train_losses, test_losses = train.train_seg(
+                model.net,
+                train_data=train_imgs,
+                train_labels=train_masks,
+                test_data=None,
+                test_labels=None,
+                weight_decay=float(wd),
+                learning_rate=float(lr),
+                n_epochs=int(n_epochs),
+                model_name=str(model_name),
+            )
+
+            # Record where it saved + metadata
+            meta = dict(
+                backend="cellpose",
+                pretrained_start="cpsam",
+                device=dev,
+                model_name=model_name,
+                model_out_path=str(model_out_path),
+                n_train_images=len(train_imgs),
+                n_epochs=int(n_epochs),
+                learning_rate=float(lr),
+                weight_decay=float(wd),
+                created=time.strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            with open(os.path.join(model_path, "cellpose_model_meta.json"), "w") as f:
+                json.dump(meta, f, indent=2)
+
+            st["ml_model_path"] = model_path
+            st["ml_backend"] = "cellpose"
+            st["ml_last_trained_model_file"] = str(model_out_path)
+
+            self._cell_counter_set_status(f"Device: {dev} | Backend: cellpose | Trained: {model_name}")
+            QMessageBox.information(
+                cc.window.qt_viewer,
+                "ML",
+                f"Training complete.\nModel name: {model_name}\nSaved model file:\n{model_out_path}\nMeta in:\n{os.path.join(model_path, 'cellpose_model_meta.json')}",
+            )
+
+        except Exception as e:
+            try:
+                self._cell_counter_set_status("ML training failed")
+            except Exception:
+                pass
+            QMessageBox.critical(self, "Error", f"Cellpose training failed:\n{e}")
+
+    def _cell_counter_ml_infer(self, backend="Cellpose (recommended)", device="auto", model_path=""):
+        try:
+            st = getattr(self, "_cell_counter_state", None)
+            if not st:
+                QMessageBox.warning(self, "ML", "No cell-counter session found.")
+                return
+
+            if "Cellpose" not in (backend or ""):
+                QMessageBox.warning(self, "ML", "Only Cellpose backend is implemented right now.")
+                return
+
+            cc = st["viewer"]
+            vol = np.asarray(st["vol"], dtype=np.float32)  # (Z,Y,X)
+            labels_layer = st["labels"]
+
+            dev = self._cellpose_device_from_ui(device)
+            st["ml_device"] = dev
+            st["ml_backend"] = "cellpose"
+
+            if not model_path:
+                model_path = st.get("ml_model_path", "") or ""
+            if model_path:
+                st["ml_model_path"] = model_path
+
+            # Resolve model file
+            model_file = st.get("ml_last_trained_model_file", "")
+
+            meta_file = os.path.join(model_path, "cellpose_model_meta.json") if model_path else ""
+            if (not model_file) and meta_file and os.path.exists(meta_file):
+                try:
+                    with open(meta_file, "r") as f:
+                        meta = json.load(f)
+                    model_file = meta.get("model_out_path", "") or ""
+                except Exception:
+                    model_file = ""
+
+            if not model_file or not os.path.exists(model_file):
+                # Let user pick the trained model file directly
+                model_file, _ = QFileDialog.getOpenFileName(
+                    cc.window.qt_viewer,
+                    "Select Cellpose model file",
+                    model_path or "",
+                    "All files (*)",
+                )
+                if not model_file:
+                    return
+
+            self._cell_counter_set_status(f"Device: {dev} | Backend: cellpose | Infer...")
+
+            # Build model
+            try:
+                import torch
+                device_obj = torch.device(dev)
+            except Exception:
+                device_obj = None
+            gpu_flag = (dev == "cuda" or dev == "mps")
+
+            model = models.CellposeModel(gpu=gpu_flag, device=device_obj, pretrained_model=model_file)
+
+            # Ask for key eval params
+            diameter, ok = QInputDialog.getDouble(
+                cc.window.qt_viewer,
+                "Cellpose diameter",
+                "Approx cell diameter in pixels (0 = auto):",
+                value=0.0,
+                min=0.0,
+                max=10000.0,
+                decimals=2,
+            )
+            if not ok:
+                return
+
+            # 2D-per-slice inference
+            Z = vol.shape[0]
+            out = np.zeros_like(vol, dtype=np.int32)
+            next_id = 0
+
+            # Basic channel handling: single-channel grayscale => channels=[0,0]
+            # (Cellpose uses channel indices; for grayscale you typically pass [0,0].)
+            channels = [0, 0]
+
+            for z in range(Z):
+                img2 = np.asarray(vol[z], dtype=np.float32)
+
+                masks, flows, styles, diams = model.eval(
+                    img2,
+                    channels=channels,
+                    diameter=(None if float(diameter) <= 0 else float(diameter)),
+                    do_3D=False,
+                )
+
+                masks = np.asarray(masks, dtype=np.int32)
+                if masks.size == 0 or int(masks.max()) == 0:
+                    continue
+
+                # Relabel slice so IDs are unique across Z
+                m = masks
+                unique_ids = np.unique(m)
+                unique_ids = unique_ids[unique_ids != 0]
+                if unique_ids.size:
+                    remap = {int(uid): (next_id + i + 1) for i, uid in enumerate(unique_ids)}
+                    next_id += int(unique_ids.size)
+                    m2 = np.zeros_like(m, dtype=np.int32)
+                    for uid, nid in remap.items():
+                        m2[m == uid] = nid
+                    out[z] = m2
+
+            labels_layer.data = out
+            n_cells = int(out.max())
+            st["ml_last_trained_model_file"] = model_file
+
+            self._cell_counter_set_status(f"Device: {dev} | Backend: cellpose | Done ({n_cells} labels)")
+            QMessageBox.information(cc.window.qt_viewer, "ML", f"Cellpose inference complete.\nDetected (slice-stacked) objects: {n_cells}")
+
+        except Exception as e:
+            try:
+                self._cell_counter_set_status("ML inference failed")
+            except Exception:
+                pass
+            QMessageBox.critical(self, "Error", f"Cellpose inference failed:\n{e}")
+
+    def _cell_counter_ml_save(self, backend="Cellpose (recommended)", device="auto", model_path=""):
+        try:
+            st = getattr(self, "_cell_counter_state", None)
+            if not st:
+                return
+
+            cc = st["viewer"]
+            if "Cellpose" not in (backend or ""):
+                QMessageBox.warning(self, "ML", "Only Cellpose backend is implemented right now.")
+                return
+
+            model_file = st.get("ml_last_trained_model_file", "")
+            if not model_file or not os.path.exists(model_file):
+                QMessageBox.information(cc.window.qt_viewer, "ML", "No trained model file found to save. Train first.")
+                return
+
+            if not model_path:
+                model_path = QFileDialog.getExistingDirectory(cc.window.qt_viewer, "Select folder to save/copy model")
+                if not model_path:
+                    return
+            os.makedirs(model_path, exist_ok=True)
+
+            # Copy model file into folder
+            dst = os.path.join(model_path, os.path.basename(model_file))
+            if os.path.abspath(dst) != os.path.abspath(model_file):
+                shutil.copy2(model_file, dst)
+
+            # Also copy meta if present from current ml_model_path
+            src_meta = ""
+            if st.get("ml_model_path", ""):
+                cand = os.path.join(st["ml_model_path"], "cellpose_model_meta.json")
+                if os.path.exists(cand):
+                    src_meta = cand
+            if src_meta:
+                shutil.copy2(src_meta, os.path.join(model_path, "cellpose_model_meta.json"))
+
+            st["ml_model_path"] = model_path
+            self._cell_counter_set_status(f"Device: {st.get('ml_device','?')} | Backend: cellpose | Model saved")
+            QMessageBox.information(cc.window.qt_viewer, "ML", f"Saved/copied model to:\n{model_path}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Save model failed:\n{e}")
+
+    def _cell_counter_set_status(self, text: str):
+        st = getattr(self, "_cell_counter_state", None)
+        if not st:
+            return
+        lab = st.get("status_label", None)
+        if lab is not None:
+            try:
+                lab.setText(text)
+            except Exception:
+                pass
 
     def _cell_counter_run_detection(
         self,
@@ -2289,7 +3108,6 @@ class UIWidget(QWidget):
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Cell detection failed:\n{e}")
-
 
     def calculate_intensities_per_cell(self):
         """
