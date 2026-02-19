@@ -1640,14 +1640,11 @@ class UIWidget(QWidget):
         }
         return gb, ctrl
 
-
     def open_analysis(self):
         # Keep a reference so dialog doesn't get garbage-collected
         self.analysis_dialog = AnalysisPopupDialog(self)
         self.analysis_dialog.show()
-    ###########################################################################
-    # Save JSON metadata
-    ###########################################################################
+
     def save_output(self):
         """Save metadata (UI + per-channel display settings) to JSON."""
         try:
@@ -1719,9 +1716,6 @@ class UIWidget(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save metadata: {str(e)}")
     
-    ###########################################################################
-    # Loading metadata from JSON 
-    ###########################################################################
     def load_metadata(self):
         """Load metadata JSON from meta_data/<thisfile>.json and apply to UI/layers."""
         try:
@@ -2087,7 +2081,6 @@ class UIWidget(QWidget):
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open cell counter:\n{e}")
-
 
     def _cell_counter_run_detection(
         self,
@@ -2908,7 +2901,6 @@ class UIWidget(QWidget):
         except Exception:
             pass
         return int(fallback)
-
 
     def _add_coloc_controls(self, lay, out3, title: str, out_is_mask: bool):
         """
