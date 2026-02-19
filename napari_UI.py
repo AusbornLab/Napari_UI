@@ -2132,7 +2132,6 @@ class UIWidget(QWidget):
 
             # ===== Section B: ML (Cellpose) =====
             layout.addWidget(QLabel("ML model (Cellpose): train / load / infer (uses labels mask)"))
-
             layout.addWidget(QLabel("Train uses the current 'Detected cells (labels mask)' (0=bg, 1..N instances)."))
 
             ml_backend_row = QHBoxLayout()
@@ -2159,11 +2158,29 @@ class UIWidget(QWidget):
             layout.addLayout(model_path_row)
 
             def _browse_model():
+                # NOTE: using qt_viewer here matches your existing code; you can swap to cc.window._qt_window later.
                 pth = QFileDialog.getExistingDirectory(cc.window.qt_viewer, "Select model folder")
                 if pth:
                     model_path.setText(pth)
 
             browse_btn.clicked.connect(_browse_model)
+
+            # ---- NEW: Model mode (pretrained cpsam vs custom weights) ----
+            ml_mode_row = QHBoxLayout()
+            ml_mode_row.addWidget(QLabel("Model mode"))
+
+            ml_mode = QComboBox()
+            ml_mode.addItems([
+                "Pretrained (cpsam) – no training data",
+                "Custom weights (from folder/file) – train or load",
+            ])
+            ml_mode.setCurrentIndex(0)
+
+            ml_mode_row.addWidget(ml_mode)
+            layout.addLayout(ml_mode_row)
+
+            self._cell_counter_state["ml_mode_combo"] = ml_mode
+            # -------------------------------------------------------------
 
             load_btn = QPushButton("Load model / weights")
             train_btn = QPushButton("Train Cellpose from labels mask (manual-first)")
@@ -2194,26 +2211,70 @@ class UIWidget(QWidget):
             self._cell_counter_state["ml_worker"] = None
             self._cell_counter_state["ml_cancel_flag"] = False
 
-            load_btn.clicked.connect(lambda _=False: self._cell_counter_ml_load(
+            # --- UPDATED: Load should support both modes ---
+            # If mode=Pretrained -> just set cpsam and clear any custom file
+            # If mode=Custom -> try to resolve weights file now (prompt if needed) and store it
+            def _ml_load_clicked():
+                st = getattr(self, "_cell_counter_state", None)
+                if not st:
+                    return
+                mode_txt = ""
+                try:
+                    mode_txt = st["ml_mode_combo"].currentText()
+                except Exception:
+                    mode_txt = ""
+
+                mp = str(model_path.text()).strip()
+
+                if "Pretrained (cpsam)" in (mode_txt or ""):
+                    st["ml_last_trained_model_file"] = ""
+                    st["ml_model_path"] = mp
+                    self._cell_counter_set_status(f"Device: {self._torch_best_device()} | Backend: cellpose | Weights: cpsam")
+                    self._ml_ui_set_progress("ML progress: using pretrained cpsam", 0)
+                    return
+
+                # Custom mode: prompt/resolve a weights file now
+                w = self._cell_counter_resolve_infer_weights(model_path=mp)
+                st["ml_model_path"] = mp
+                st["ml_last_trained_model_file"] = w if (w and w != "cpsam") else st.get("ml_last_trained_model_file", "")
+                self._cell_counter_set_status(f"Device: {self._torch_best_device()} | Backend: cellpose | Weights: {os.path.basename(w) if os.path.exists(w) else w}")
+                self._ml_ui_set_progress("ML progress: custom weights loaded", 0)
+
+            load_btn.clicked.connect(lambda _=False: _ml_load_clicked())
+
+            train_btn.clicked.connect(lambda _=False: self._cell_counter_ml_train_threaded(
                 backend=str(ml_backend.currentText()),
                 device=str(device.currentText()),
                 model_path=str(model_path.text()).strip(),
             ))
-            train_btn.clicked.connect(lambda _=False: self._cell_counter_ml_train_threaded(
-            backend=str(ml_backend.currentText()),
-            device=str(device.currentText()),
-            model_path=str(model_path.text()).strip(),
-            ))
+
             infer_btn.clicked.connect(lambda _=False: self._cell_counter_ml_infer(
                 backend=str(ml_backend.currentText()),
                 device=str(device.currentText()),
                 model_path=str(model_path.text()).strip(),
             ))
+
             save_btn.clicked.connect(lambda _=False: self._cell_counter_ml_save(
                 backend=str(ml_backend.currentText()),
                 device=str(device.currentText()),
                 model_path=str(model_path.text()).strip(),
             ))
+
+
+            ml_mode_row = QHBoxLayout()
+            ml_mode_row.addWidget(QLabel("Model mode"))
+
+            ml_mode = QComboBox()
+            ml_mode.addItems([
+                "Pretrained (cpsam) – no training data",
+                "Custom weights (from folder/file) – train or load",
+            ])
+            ml_mode.setCurrentIndex(0)
+
+            ml_mode_row.addWidget(ml_mode)
+            layout.addLayout(ml_mode_row)
+
+            self._cell_counter_state["ml_mode_combo"] = ml_mode
 
             # ===== Section C: Analysis / export =====
             layout.addWidget(QLabel("Analysis / export"))
@@ -2243,6 +2304,54 @@ class UIWidget(QWidget):
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open cell counter:\n{e}")
+            
+    def _cell_counter_resolve_infer_weights(self, model_path: str = "") -> str:
+        """
+        Returns a string to pass to CellposeModel(pretrained_model=...).
+        Either "cpsam" or a path to a trained weights file.
+        """
+        st = getattr(self, "_cell_counter_state", None)
+        if not st:
+            return "cpsam"
+
+        mode_combo = st.get("ml_mode_combo", None)
+        mode_txt = mode_combo.currentText() if mode_combo is not None else ""
+
+        # Mode A: always use cpsam
+        if "Pretrained (cpsam)" in (mode_txt or ""):
+            return "cpsam"
+
+        # Mode B: custom weights: try last trained file, then meta.json, else ask user
+        model_path = (model_path or st.get("ml_model_path", "") or "").strip()
+        model_file = (st.get("ml_last_trained_model_file", "") or "").strip()
+
+        meta_file = os.path.join(model_path, "cellpose_model_meta.json") if model_path else ""
+        if (not model_file) and meta_file and os.path.exists(meta_file):
+            try:
+                with open(meta_file, "r") as f:
+                    meta = json.load(f)
+                model_file = (meta.get("model_out_path", "") or "").strip()
+            except Exception:
+                model_file = ""
+
+        if model_file and os.path.exists(model_file):
+            return model_file
+
+        # Fall back: prompt user to pick weights file
+        cc = st.get("viewer", None)
+        parent = cc.window._qt_window if (cc is not None and hasattr(cc.window, "_qt_window")) else self
+        picked, _ = QFileDialog.getOpenFileName(
+            parent,
+            "Select Cellpose model weights file",
+            model_path or "",
+            "All files (*)",
+        )
+        if picked:
+            st["ml_last_trained_model_file"] = picked
+            return picked
+
+        # If user cancels, default back to cpsam (safe)
+        return "cpsam"
 
     def _fmt_hms(self, sec: float) -> str:
         sec = int(max(0, sec))
@@ -2392,7 +2501,7 @@ class UIWidget(QWidget):
         dev = self._torch_best_device() if (device == "auto") else self._cellpose_device_from_ui(device)
 
         # Pull data
-        vol = np.asarray(st["vol"], dtype=np.float32)        # (Z,Y,X)
+        vol = np.asarray(st["vol"], dtype=np.float32)  # (Z,Y,X)
         labels_layer = st["labels"]
         lab3d = np.asarray(labels_layer.data, dtype=np.int32)
 
@@ -2429,12 +2538,12 @@ class UIWidget(QWidget):
             device_obj = None
 
         gpu_flag = (dev == "cuda" or dev == "mps")
-        # This triggers model download on first use if needed
         model = models.CellposeModel(gpu=gpu_flag, device=device_obj, pretrained_model=str(start_model))
 
         yield {"pct": 30, "msg": f"Training... elapsed {self._fmt_hms(time.time()-t0)} (epochs={int(n_epochs)})"}
 
         # After this point we cannot cancel cleanly until train_seg returns.
+        # IMPORTANT CHANGE: force saving into model_path via save_path (supported by Cellpose train API).
         model_out_path, train_losses, test_losses = train.train_seg(
             model.net,
             train_data=train_imgs,
@@ -2445,6 +2554,7 @@ class UIWidget(QWidget):
             learning_rate=float(lr),
             n_epochs=int(n_epochs),
             model_name=str(model_name),
+            save_path=str(model_path),
         )
 
         meta = dict(
@@ -2546,7 +2656,103 @@ class UIWidget(QWidget):
         QMessageBox.information(self, "ML", "Train is wired, but training implementation is not added yet.")
 
     def _cell_counter_ml_infer(self, backend="Cellpose (recommended)", device="auto", model_path=""):
-        QMessageBox.information(self, "ML", "Inference is wired, but inference implementation is not added yet.")
+        try:
+            st = getattr(self, "_cell_counter_state", None)
+            if not st:
+                QMessageBox.warning(self, "ML", "No cell-counter session found.")
+                return
+
+            if "Cellpose" not in (backend or ""):
+                QMessageBox.warning(self, "ML", "Only Cellpose backend is implemented right now.")
+                return
+
+            cc = st["viewer"]
+            vol = np.asarray(st["vol"], dtype=np.float32)  # (Z,Y,X)
+            labels_layer = st["labels"]
+
+            dev = self._cellpose_device_from_ui(device)
+            st["ml_device"] = dev
+            st["ml_backend"] = "cellpose"
+
+            if not model_path:
+                model_path = st.get("ml_model_path", "") or ""
+            if model_path:
+                st["ml_model_path"] = model_path
+
+            # IMPORTANT CHANGE: resolve weights based on Model mode
+            weights = self._cell_counter_resolve_infer_weights(model_path=model_path)
+
+            self._cell_counter_set_status(f"Device: {dev} | Backend: cellpose | Infer ({'cpsam' if weights=='cpsam' else 'custom'})")
+
+            # Build model
+            try:
+                import torch
+                device_obj = torch.device(dev)
+            except Exception:
+                device_obj = None
+            gpu_flag = (dev == "cuda" or dev == "mps")
+
+            model = models.CellposeModel(gpu=gpu_flag, device=device_obj, pretrained_model=weights)
+
+            # Ask for key eval params
+            diameter, ok = QInputDialog.getDouble(
+                cc.window.qt_viewer,
+                "Cellpose diameter",
+                "Approx cell diameter in pixels (0 = auto):",
+                value=0.0,
+                min=0.0,
+                max=10000.0,
+                decimals=2,
+            )
+            if not ok:
+                return
+
+            # 2D-per-slice inference
+            Z = vol.shape[0]
+            out = np.zeros_like(vol, dtype=np.int32)
+            next_id = 0
+
+            channels = [0, 0]
+
+            for z in range(Z):
+                img2 = np.asarray(vol[z], dtype=np.float32)
+
+                masks, flows, styles, diams = model.eval(
+                    img2,
+                    channels=channels,
+                    diameter=(None if float(diameter) <= 0 else float(diameter)),
+                    do_3D=False,
+                )
+
+                masks = np.asarray(masks, dtype=np.int32)
+                if masks.size == 0 or int(masks.max()) == 0:
+                    continue
+
+                unique_ids = np.unique(masks)
+                unique_ids = unique_ids[unique_ids != 0]
+                if unique_ids.size:
+                    remap = {int(uid): (next_id + i + 1) for i, uid in enumerate(unique_ids)}
+                    next_id += int(unique_ids.size)
+                    m2 = np.zeros_like(masks, dtype=np.int32)
+                    for uid, nid in remap.items():
+                        m2[masks == uid] = nid
+                    out[z] = m2
+
+            labels_layer.data = out
+            n_cells = int(out.max())
+
+            # Track last-used weights (for custom mode, this is your selected file; for cpsam it's just "cpsam")
+            st["ml_last_trained_model_file"] = weights
+
+            self._cell_counter_set_status(f"Device: {dev} | Backend: cellpose | Done ({n_cells} labels)")
+            QMessageBox.information(cc.window.qt_viewer, "ML", f"Cellpose inference complete.\nDetected (slice-stacked) objects: {n_cells}")
+
+        except Exception as e:
+            try:
+                self._cell_counter_set_status("ML inference failed")
+            except Exception:
+                pass
+            QMessageBox.critical(self, "Error", f"Cellpose inference failed:\n{e}")
 
     def _torch_best_device(self):
         """Return a torch.device string: 'cuda' | 'mps' | 'cpu'."""
