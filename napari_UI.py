@@ -16,7 +16,7 @@ from qtpy.QtWidgets import (
 from qtpy.QtCore import Qt
 
 from skimage.filters import gaussian, threshold_otsu
-from skimage.morphology import remove_small_objects, closing, disk, dilation
+from skimage.morphology import remove_small_objects, closing, disk, dilation, ball, binary_opening
 from aicsimageio import AICSImage
 import tifffile
 import imageio
@@ -30,6 +30,8 @@ from scipy import ndimage as ndi
 from skimage.draw import polygon2mask
 import re
 import xml.etree.ElementTree as ET
+from skimage.morphology import disk, dilation, remove_small_objects
+from skimage.feature import peak_local_max
 
 
 
@@ -1838,8 +1840,8 @@ class UIWidget(QWidget):
         - User selects exactly ONE layer from main viewer.
         - Cell Counter viewer gets exactly ONE Image layer:
             name = "Detection input - <selected layer name>"
-            colormap copied from that main viewer layer (supports hex string). 
-        - Shapes + Labels layers are added (these will always appear in layer list).
+            colormap copied from that main viewer layer (supports hex string).
+        - Shapes + Labels layers are added.
         - State stores references so later code does not depend on layer names.
         """
         try:
@@ -1860,7 +1862,6 @@ class UIWidget(QWidget):
             for nm in layer_names:
                 it = QListWidgetItem(nm)
                 lst.addItem(it)
-                # preselect first "Channel <n>" if present
                 if lst.currentItem() is None and nm.startswith("Channel ") and nm[8:].isdigit():
                     lst.setCurrentItem(it)
             v.addWidget(lst)
@@ -1880,13 +1881,13 @@ class UIWidget(QWidget):
 
             selected_name = item.text()
 
-            # Grab the actual layer object (better than re-looking-up later)
+            # Grab the actual layer object
             try:
                 src_layer = self.viewer.layers[selected_name]
             except Exception:
                 src_layer = None
 
-            # Resolve 3D stack from that layer
+            # Resolve 3D stack
             s3 = self._resolve_stack3d(selected_name)
             if s3 is None:
                 QMessageBox.warning(self, "Missing data", f"Could not resolve stack for: {selected_name}")
@@ -1897,15 +1898,14 @@ class UIWidget(QWidget):
                 QMessageBox.warning(self, "Unsupported", f"{selected_name} is not 3D (shape {vol.shape}).")
                 return
 
-            # Pull the EXACT current colormap from the main UI layer.
-            # In your UI, you set lyr.colormap = "#RRGGBB", which napari supports.
+            # Pull current colormap from main layer
             cmap_arg = "gray"
             if src_layer is not None:
                 cm = getattr(src_layer, "colormap", None)
                 if isinstance(cm, str) and cm:
-                    cmap_arg = cm  # includes hex strings like "#00ff00" 
+                    cmap_arg = cm
                 elif isinstance(cm, tuple) and len(cm) >= 2 and isinstance(cm[0], str):
-                    cmap_arg = (cm[0], cm[1])  # (name, Colormap) 
+                    cmap_arg = (cm[0], cm[1])
 
             # --- create cell-counter viewer ---
             cc = napari.Viewer()
@@ -1948,12 +1948,12 @@ class UIWidget(QWidget):
             labels_layer = cc.add_labels(np.zeros(vol.shape, dtype=np.int32), name="Detected cells")
             labels_layer.visible = True
 
-            # Store refs so downstream code works even if user renames layers
+            # Store refs
             self._cell_counter_state = dict(
                 viewer=cc,
                 vol=vol,
-                detection_layer=det_layer,         # <- use this for intensity export defaults if desired
-                source_main_layer=src_layer,       # <- so you can re-pull colormap later if you want
+                detection_layer=det_layer,
+                source_main_layer=src_layer,
                 pos_shapes=pos_shapes,
                 neg_shapes=neg_shapes,
                 labels=labels_layer,
@@ -1999,6 +1999,7 @@ class UIWidget(QWidget):
             layout.addWidget(QLabel("2) Draw RED polygons over neurites/junk/background to exclude."))
             layout.addWidget(QLabel("3) Run detection to segment + count; then measure intensities."))
 
+            # Threshold
             th_row = QHBoxLayout()
             th_row.addWidget(QLabel("Threshold (0–1)"))
             th = QSlider(Qt.Horizontal)
@@ -2017,6 +2018,7 @@ class UIWidget(QWidget):
 
             th.valueChanged.connect(_sync_th)
 
+            # Min voxels
             minvox_row = QHBoxLayout()
             minvox_row.addWidget(QLabel("Min voxels"))
             minvox = QSpinBox()
@@ -2025,14 +2027,16 @@ class UIWidget(QWidget):
             minvox_row.addWidget(minvox)
             layout.addLayout(minvox_row)
 
+            # Max voxels
             maxvox_row = QHBoxLayout()
-            maxvox_row.addWidget(QLabel("Max voxels"))
+            maxvox_row.addWidget(QLabel("Max voxels (0=off)"))
             maxvox = QSpinBox()
             maxvox.setRange(0, 10_000_000)
             maxvox.setValue(0)
             maxvox_row.addWidget(maxvox)
             layout.addLayout(maxvox_row)
 
+            # Compactness
             comp_row = QHBoxLayout()
             comp_row.addWidget(QLabel("Watershed compactness"))
             comp = QDoubleSpinBox()
@@ -2042,6 +2046,7 @@ class UIWidget(QWidget):
             comp_row.addWidget(comp)
             layout.addLayout(comp_row)
 
+            # Neg ROI grow
             neggrow_row = QHBoxLayout()
             neggrow_row.addWidget(QLabel("Neg ROI grow (px)"))
             neg_grow = QSpinBox()
@@ -2049,6 +2054,40 @@ class UIWidget(QWidget):
             neg_grow.setValue(2)
             neggrow_row.addWidget(neg_grow)
             layout.addLayout(neggrow_row)
+
+            # --- NEW: smoothing ---
+            gs_row = QHBoxLayout()
+            gs_row.addWidget(QLabel("Gaussian sigma (0=off)"))
+            gs = QDoubleSpinBox()
+            gs.setDecimals(2)
+            gs.setRange(0.0, 10.0)
+            gs.setValue(1.0)
+            gs_row.addWidget(gs)
+            layout.addLayout(gs_row)
+
+            # --- NEW: soma opening ---
+            open_row = QHBoxLayout()
+            open_row.addWidget(QLabel("Soma opening radius (px)"))
+            open_r = QSpinBox()
+            open_r.setRange(0, 10)
+            open_r.setValue(1)
+            open_row.addWidget(open_r)
+            layout.addLayout(open_row)
+
+            # --- NEW: auto-split ---
+            split_row = QHBoxLayout()
+            auto_split = QCheckBox("Auto-split touching cells (distance peaks)")
+            auto_split.setChecked(True)
+            split_row.addWidget(auto_split)
+            layout.addLayout(split_row)
+
+            seed_row = QHBoxLayout()
+            seed_row.addWidget(QLabel("Min seed distance (px)"))
+            seed_dist = QSpinBox()
+            seed_dist.setRange(1, 100)
+            seed_dist.setValue(8)
+            seed_row.addWidget(seed_dist)
+            layout.addLayout(seed_row)
 
             run_btn = QPushButton("Run detection + count cells")
             layout.addWidget(run_btn)
@@ -2058,7 +2097,9 @@ class UIWidget(QWidget):
 
             ss_btn = QPushButton("Save Screenshot")
             ss_btn.clicked.connect(
-                lambda _=False: self.save_screenshot(viewer=cc, parent=self, default_name="cell_counter.png", canvas_only=True)
+                lambda _=False: self.save_screenshot(
+                    viewer=cc, parent=self, default_name="cell_counter.png", canvas_only=True
+                )
             )
             layout.addWidget(ss_btn)
 
@@ -2073,14 +2114,18 @@ class UIWidget(QWidget):
                     max_voxels=int(maxvox.value()),
                     compactness=float(comp.value()),
                     neg_grow=int(neg_grow.value()),
+                    gaussian_sigma=float(gs.value()),
+                    open_radius=int(open_r.value()),
+                    auto_split=bool(auto_split.isChecked()),
+                    min_seed_distance=int(seed_dist.value()),
                 )
             )
             measure_btn.clicked.connect(lambda _=False: self.calculate_intensities_per_cell())
-
             return
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open cell counter:\n{e}")
+
 
     def _cell_counter_run_detection(
         self,
@@ -2089,13 +2134,21 @@ class UIWidget(QWidget):
         max_voxels=0,
         compactness=0.0,
         neg_grow=2,
+        gaussian_sigma=1.0,
+        open_radius=1,
+        auto_split=True,
+        min_seed_distance=8,
     ):
         """
-        Seeded segmentation:
-        - Foreground mask from threshold on normalized volume
+        Improved seeded segmentation:
+
+        - Foreground from threshold on normalized volume
+        - Optional smoothing
+        - Optional soma-only cleanup (3D opening + remove_small_objects)
         - Positive ROIs -> markers (seeds)
-        - Negative ROIs -> exclusion mask (removed from foreground)
-        - Watershed on distance transform, constrained to foreground
+        - Negative ROIs -> exclusion mask
+        - Optional auto-split markers from distance peaks
+        - Watershed on distance transform
         - Size filtering
         """
         try:
@@ -2118,7 +2171,6 @@ class UIWidget(QWidget):
                 norm = np.clip((vol - vmin) / (vmax - vmin), 0, 1)
 
             Z, Y, X = norm.shape
-
 
             def _rasterize_shapes_to_masks(shapes_layer):
                 out = []
@@ -2154,6 +2206,7 @@ class UIWidget(QWidget):
                     out.append((z, m))
                 return out
 
+            # Seeds from positive ROIs
             seeds = np.zeros((Z, Y, X), dtype=np.int32)
             pos = _rasterize_shapes_to_masks(pos_shapes)
             if len(pos) == 0:
@@ -2165,27 +2218,58 @@ class UIWidget(QWidget):
                 seed_id += 1
                 seeds[z, m2d] = seed_id
 
+            # Negative mask (with grow)
             neg_mask = np.zeros((Z, Y, X), dtype=bool)
             neg = _rasterize_shapes_to_masks(neg_shapes)
             if len(neg) > 0:
-                se = disk(int(neg_grow)) if int(neg_grow) > 0 else None
+                se2 = disk(int(neg_grow)) if int(neg_grow) > 0 else None
                 for z, m2d in neg:
-                    if se is not None:
-                        m2d = dilation(m2d, se)
+                    if se2 is not None:
+                        m2d = dilation(m2d, se2)
                     neg_mask[z, m2d] = True
 
-            fg = (norm >= float(threshold))
+            # Foreground mask from threshold (optionally after smoothing)
+            img = norm
+            if float(gaussian_sigma) > 0:
+                img = gaussian(img, sigma=float(gaussian_sigma), preserve_range=True)
+
+            fg = (img >= float(threshold))
             if neg_mask.any():
                 fg = fg & (~neg_mask)
 
+            # Soma-only cleanup: opening removes thin processes [web:293]
+            r = int(open_radius)
+            if r > 0:
+                fg = binary_opening(fg, footprint=ball(r))
+
+            # Remove small junk objects (3D) [web:461]
+            fg = remove_small_objects(fg, min_size=int(min_voxels), connectivity=1)
+
             if not fg.any():
                 labels_layer.data = np.zeros_like(seeds, dtype=np.int32)
-                QMessageBox.information(cc.window.qt_viewer, "Cell Counter", "Threshold/negative mask removed all foreground.")
+                QMessageBox.information(cc.window.qt_viewer, "Cell Counter", "No foreground after threshold/cleanup.")
                 return
 
+            # Watershed on distance transform with markers [web:292]
             dist = ndi.distance_transform_edt(fg)
-            seg = watershed(-dist, markers=seeds, mask=fg, compactness=float(compactness))
+            markers = seeds.copy()
 
+            # Optional auto-split: add distance peaks as extra markers [web:8]
+            if bool(auto_split):
+                coords = peak_local_max(
+                    dist,
+                    min_distance=int(max(1, min_seed_distance)),
+                    labels=fg,
+                    exclude_border=False,
+                )
+                for (zz, yy, xx) in coords:
+                    if markers[zz, yy, xx] == 0:
+                        seed_id += 1
+                        markers[zz, yy, xx] = seed_id
+
+            seg = watershed(-dist, markers=markers, mask=fg, compactness=float(compactness))
+
+            # Size filtering
             counts = np.bincount(seg.ravel())
             out = np.zeros_like(seg, dtype=np.int32)
             new_id = 0
@@ -2205,6 +2289,7 @@ class UIWidget(QWidget):
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Cell detection failed:\n{e}")
+
 
     def calculate_intensities_per_cell(self):
         """
