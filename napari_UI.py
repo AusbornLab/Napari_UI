@@ -726,21 +726,31 @@ class MaskTunerDialog(QDialog):
     # ---------------- UI handlers ----------------
     def _on_z_changed(self, v):
         self.z = int(v)
-        if getattr(self, "nz", 0) <= 0:
+
+        # If nz is invalid, do nothing
+        nz = int(getattr(self, "nz", 0) or 0)
+        if nz <= 0:
             return
-        self.z = max(0, min(self.z, self.nz - 1))
 
-        self.z_label.setText(f"{self.z}/{max(self.nz - 1, 0)}")
+        self.z = max(0, min(self.z, nz - 1))
+        self.z_label.setText(f"{self.z}/{max(nz - 1, 0)}")
 
-        # Update your main displayed layers
-        self.img_layer.data = self.arr3[self.z]
-        self.mask_layer.data = self.preview_masks[self.z]
-        try:
-            self.mask_layer.contrast_limits = (0, 1)
-        except Exception:
-            pass
+        # Only slice if the backing stacks are actually 3D
+        if hasattr(self, "arr3"):
+            a = np.asarray(self.arr3)
+            if a.ndim == 3 and a.shape[0] == nz:
+                self.img_layer.data = a[self.z]
 
-        # Update any dynamically loaded channels (2D view layers)
+        if hasattr(self, "preview_masks"):
+            m = np.asarray(self.preview_masks)
+            if m.ndim == 3 and m.shape[0] == nz:
+                self.mask_layer.data = m[self.z]
+                try:
+                    self.mask_layer.contrast_limits = (0, 1)
+                except Exception:
+                    pass
+
+        # Update dynamically loaded channels
         if hasattr(self, "channel_full_stacks") and hasattr(self, "channel_layers"):
             for stack, lay in zip(self.channel_full_stacks, self.channel_layers):
                 a = np.asarray(stack)
@@ -748,9 +758,10 @@ class MaskTunerDialog(QDialog):
                     z = max(0, min(self.z, a.shape[0] - 1))
                     lay.data = a[z]
                 else:
-                    lay.data = a  # 2D stays 2D
+                    lay.data = a
 
         self._preview_current_slice()
+
 
 
     def _dtype_max_value(self, dtype):
@@ -3834,10 +3845,23 @@ class UIWidget(QWidget):
                 return
 
             p = Path(path)
+            print(f"\n[load_channels] Loading: {p}")
+
             if p.suffix.lower() == ".lif":
                 mmaps, clims, vox, temp = load_lif_memmap(p, max_ch=4)
             else:
                 mmaps, clims, vox, temp = load_tiff_memmap(p, max_ch=4)
+
+            # Debug: what did the loader return?
+            try:
+                print(f"[load_channels] mmaps type={type(mmaps)}, len={len(mmaps) if mmaps is not None else 'None'}")
+            except Exception as _:
+                print("[load_channels] mmaps: (could not get len)")
+
+            if mmaps is None:
+                print("[load_channels] ERROR: mmaps is None")
+                QMessageBox.warning(self, "Load", "No channels returned by loader.")
+                return
 
             # Ensure lists exist
             self.channel_list = getattr(self, "channel_list", []) or []
@@ -3848,63 +3872,128 @@ class UIWidget(QWidget):
             if not hasattr(self, "contrast_limits") or self.contrast_limits is None:
                 self.contrast_limits = {}
 
-            # Choose initial z
-            # (If you already track self.z somewhere, keep it; else default 0)
+            # Keep current z/nz if present
             self.z = int(getattr(self, "z", 0))
+            prev_nz = int(getattr(self, "nz", 1) or 1)
 
-            start_idx = len(self.channel_list)  # 0-based count before adding
+            # Debug: current app stacks
+            try:
+                a0 = np.asarray(getattr(self, "arr3", None))
+                print(f"[load_channels] existing arr3: {'None' if a0 is None else (a0.shape, a0.dtype, a0.ndim, a0.size)}")
+            except Exception as e:
+                print(f"[load_channels] existing arr3: error {e}")
 
+            try:
+                pm = np.asarray(getattr(self, "preview_masks", None))
+                print(f"[load_channels] existing preview_masks: {'None' if pm is None else (pm.shape, pm.dtype, pm.ndim, pm.size)}")
+            except Exception as e:
+                print(f"[load_channels] existing preview_masks: error {e}")
+
+            start_idx = len(self.channel_list)
+            print(f"[load_channels] start_idx={start_idx}, prev_nz={prev_nz}, current z={self.z}")
+
+            # Add new channels
             for j, ch in enumerate(mmaps):
-                new_idx = start_idx + j + 1  # 1-based channel number for naming
+                new_idx = start_idx + j + 1
 
                 stack = np.asarray(ch)
+
+                # Debug each returned channel
+                try:
+                    print(
+                        f"[load_channels] incoming ch{j+1}: shape={stack.shape}, ndim={stack.ndim}, "
+                        f"dtype={stack.dtype}, size={stack.size}, nbytes={stack.nbytes}"
+                    )
+                except Exception as e:
+                    print(f"[load_channels] incoming ch{j+1}: could not print details ({e})")
+
                 self.channel_full_stacks.append(stack)
                 self.channel_list.append(ch)
 
-                # Determine nz from this stack (assume ZYX if 3D)
-                nz = stack.shape[0] if stack.ndim == 3 else 1
-                z0 = int(max(0, min(self.z, nz - 1)))
+                nz_this = int(stack.shape[0]) if stack.ndim == 3 else 1
+                z0 = int(max(0, min(self.z, nz_this - 1)))
 
-                # Create a 2D view for the layer (so your _on_z_changed can keep working)
                 view2d = stack[z0] if stack.ndim == 3 else stack
+
+                # Debug view2d
+                try:
+                    v2 = np.asarray(view2d)
+                    print(
+                        f"[load_channels] display view for Channel {new_idx}: shape={v2.shape}, ndim={v2.ndim}, "
+                        f"dtype={v2.dtype}, size={v2.size}"
+                    )
+                except Exception:
+                    pass
 
                 lay = self.viewer.add_image(view2d, name=f"Channel {new_idx}", opacity=1.0)
                 self.channel_layers.append(lay)
 
-                # Pick contrast limits: prefer saved clims if provided, else compute from data
-                guess = None
-                if isinstance(clims, dict):
-                    guess = clims.get(f"ch{j+1}", None)
-
+                # Contrast limits
+                guess = clims.get(f"ch{j+1}", None) if isinstance(clims, dict) else None
                 lo, hi, slider_max = self._compute_channel_display_range(stack)
 
-                # If we got a guess, use it; otherwise use computed lo/hi
                 if guess and isinstance(guess, (tuple, list)) and len(guess) == 2:
                     self.contrast_limits[f"ch{new_idx}"] = (float(guess[0]), float(guess[1]))
                 else:
                     self.contrast_limits[f"ch{new_idx}"] = (float(lo), float(hi))
 
-                # Apply to napari layer
                 try:
                     lay.contrast_limits = tuple(self.contrast_limits[f"ch{new_idx}"])
                 except Exception:
                     pass
 
-                # Build per-channel UI controls with a channel-specific max_range
-                # (Your sliders are int-based; map float masks to 0..1 slider_max=1.)
                 gb, ctrl = self._add_channel_controls(lay, new_idx, max_range=int(slider_max))
                 self.channel_controls.append(ctrl)
                 self.layout().insertWidget(self.layout().count() - 1, gb)
 
-            # Update global nz for the Z slider based on the *first* loaded stack
-            first_stack = np.asarray(self.channel_full_stacks[0])
-            self.nz = first_stack.shape[0] if first_stack.ndim == 3 else 1
+            # --------------------------
+            # Compute nz WITHOUT collapsing it due to 2D loads
+            # --------------------------
+            nz_target = None
 
+            # 1) main image stack wins
+            try:
+                a0 = np.asarray(getattr(self, "arr3", None))
+                if a0 is not None and a0.ndim == 3:
+                    nz_target = int(a0.shape[0])
+            except Exception:
+                pass
+
+            # 2) else main mask stack
+            if nz_target is None:
+                try:
+                    pm = np.asarray(getattr(self, "preview_masks", None))
+                    if pm is not None and pm.ndim == 3:
+                        nz_target = int(pm.shape[0])
+                except Exception:
+                    pass
+
+            # 3) else loaded channel stacks (max Z)
+            if nz_target is None:
+                z_candidates = []
+                for st in self.channel_full_stacks:
+                    st = np.asarray(st)
+                    if st.ndim == 3:
+                        z_candidates.append(int(st.shape[0]))
+                if z_candidates:
+                    nz_target = int(max(z_candidates))
+
+            # 4) else keep previous nz (do not reduce)
+            if nz_target is None:
+                nz_target = prev_nz
+
+            self.nz = max(1, int(nz_target))
+
+            print(f"[load_channels] nz_target decided={self.nz}")
+
+            # Update slider range/value
             self.z_slider.setRange(0, max(self.nz - 1, 0))
             self.z = int(max(0, min(self.z, self.nz - 1)))
             self.z_slider.blockSignals(True)
             self.z_slider.setValue(self.z)
             self.z_slider.blockSignals(False)
+
+            print(f"[load_channels] z_slider range set to (0, {max(self.nz - 1, 0)}), value={self.z}")
 
             # Track temp paths
             self._temp_paths = getattr(self, "_temp_paths", []) + (temp or [])
@@ -3918,9 +4007,10 @@ class UIWidget(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load channels: {e}")
 
+
+
     def export_selected_layers(self):
         try:
-            # list image-like layers
             img_layers = [lyr for lyr in self.viewer.layers if hasattr(lyr, "data")]
             if not img_layers:
                 QMessageBox.warning(self, "No layers", "No exportable layers found.")
@@ -3941,31 +4031,84 @@ class UIWidget(QWidget):
             if not out_dir:
                 return
 
+            # Helpers
+            chan_pat = re.compile(r"^\s*Channel\s+(\d+)\s*$", re.IGNORECASE)
+            mask_pat = re.compile(r"^\s*Channel\s+(\d+)\s+mask\s*$", re.IGNORECASE)
+
+            # Ensure dicts exist
+            self.masks_by_channel = getattr(self, "masks_by_channel", {}) or {}
+            self.channel_stacks_by_index = getattr(self, "channel_stacks_by_index", {}) or {}
+
             for n in nums:
                 i = n - 1
                 if i < 0 or i >= len(img_layers):
                     continue
 
                 lyr = img_layers[i]
+                name = str(getattr(lyr, "name", "") or "")
                 arr = np.asarray(lyr.data)
+                src = "layer.data"
 
-                # IMPORTANT: export the full stack (all z) if present
-                # (arr is already the full layer data; just don't slice it here.)
+                # 1) Export masks from masks_by_channel using name "Channel N mask"
+                m = mask_pat.match(name)
+                if m:
+                    ch_num = int(m.group(1))          # 1-based
+                    ch_idx = ch_num - 1               # 0-based key used by your code
+                    backing = self.masks_by_channel.get(ch_idx, None)
+                    if backing is not None and np.asarray(backing).ndim == 3:
+                        arr = np.asarray(backing)
+                        src = f"masks_by_channel[{ch_idx}]"
+                    print(f"[export] MASK '{name}': src={src}, shape={arr.shape}, dtype={arr.dtype}")
+
+                # 2) Export channels from stored stacks using name "Channel N"
+                else:
+                    m2 = chan_pat.match(name)
+                    if m2:
+                        ch_num = int(m2.group(1))  # 1-based
+                        backing = self.channel_stacks_by_index.get(ch_num, None)
+                        if backing is not None and np.asarray(backing).ndim == 3:
+                            arr = np.asarray(backing)
+                            src = f"channel_stacks_by_index[{ch_num}]"
+
+                    # 3) Fallback: if this layer is in channel_layers, export channel_full_stacks[k]
+                    if src == "layer.data" and hasattr(self, "channel_layers") and hasattr(self, "channel_full_stacks"):
+                        try:
+                            k = self.channel_layers.index(lyr)
+                        except Exception:
+                            k = None
+                        if k is not None and 0 <= k < len(self.channel_full_stacks):
+                            full = np.asarray(self.channel_full_stacks[k])
+                            if full.ndim == 3:
+                                arr = full
+                                src = f"channel_full_stacks[{k}]"
+
+                    # 4) Main image display layer backing
+                    if src == "layer.data" and lyr is getattr(self, "img_layer", None):
+                        full = getattr(self, "arr3", None)
+                        if full is not None and np.asarray(full).ndim == 3:
+                            arr = np.asarray(full)
+                            src = "arr3"
+
+                    print(f"[export] '{name}': src={src}, shape={arr.shape}, dtype={arr.dtype}")
 
                 out_arr, out_dtype, _clims = self._suggest_export_dtype_and_scale(arr)
 
-                out_path = Path(out_dir) / f"{Path(self.file_path).stem}_{lyr.name}.tif"
+                out_path = Path(out_dir) / f"{Path(self.file_path).stem}_{name}.tif"
+                meta = {"axes": "ZYX"} if np.asarray(out_arr).ndim == 3 else None
 
-                # Write with explicit photometric; tifffile preserves dtype on write
+                print(f"[export] writing '{out_path.name}': out_shape={np.asarray(out_arr).shape}, out_dtype={np.asarray(out_arr).dtype}")
+
                 tifffile.imwrite(
                     str(out_path),
                     out_arr,
                     photometric="minisblack",
+                    metadata=meta,
                 )
 
             QMessageBox.information(self, "Exported", "Selected layers exported.")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Export failed: {e}")
+
 
     def _compute_channel_display_range(self, arr):
         """Return (lo, hi, slider_max) for UI/contrast based on dtype and data."""
