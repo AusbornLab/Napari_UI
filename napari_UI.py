@@ -2667,7 +2667,7 @@ class UIWidget(QWidget):
                 return
 
             cc = st["viewer"]
-            vol = np.asarray(st["vol"], dtype=np.float32)  # (Z,Y,X)
+            vol = np.asarray(st["vol"], dtype=np.float32)  # (Z,Y,X) expected
             labels_layer = st["labels"]
 
             dev = self._cellpose_device_from_ui(device)
@@ -2679,10 +2679,16 @@ class UIWidget(QWidget):
             if model_path:
                 st["ml_model_path"] = model_path
 
-            # IMPORTANT CHANGE: resolve weights based on Model mode
+            # Resolve weights based on Model mode (your helper decides custom path vs "cpsam")
             weights = self._cell_counter_resolve_infer_weights(model_path=model_path)
 
-            self._cell_counter_set_status(f"Device: {dev} | Backend: cellpose | Infer ({'cpsam' if weights=='cpsam' else 'custom'})")
+            # Detect cpsam mode (string sentinel or filename containing it)
+            weights_str = str(weights or "")
+            is_cpsam = (weights == "cpsam") or ("cpsam" in weights_str.lower())
+
+            self._cell_counter_set_status(
+                f"Device: {dev} | Backend: cellpose | Infer ({'cpsam' if is_cpsam else 'custom'})"
+            )
 
             # Build model
             try:
@@ -2706,23 +2712,46 @@ class UIWidget(QWidget):
             )
             if not ok:
                 return
+            diameter_val = None if float(diameter) <= 0 else float(diameter)
 
             # 2D-per-slice inference
-            Z = vol.shape[0]
+            Z = int(vol.shape[0])
             out = np.zeros_like(vol, dtype=np.int32)
             next_id = 0
 
+            # Classic Cellpose uses channels; Cellpose-SAM (cpsam) does not 
             channels = [0, 0]
 
             for z in range(Z):
-                img2 = np.asarray(vol[z], dtype=np.float32)
+                img2 = np.asarray(vol[z], dtype=np.float32)  # (Y,X)
 
-                masks, flows, styles, diams = model.eval(
-                    img2,
-                    channels=channels,
-                    diameter=(None if float(diameter) <= 0 else float(diameter)),
-                    do_3D=False,
-                )
+                # Make sure we provide a shape cpsam can use: first 3 channels are used 
+                if is_cpsam:
+                    # Convert grayscale (Y,X) -> (Y,X,3)
+                    if img2.ndim == 2:
+                        img_in = np.stack([img2, img2, img2], axis=-1)
+                    elif img2.ndim == 3 and img2.shape[-1] >= 3:
+                        img_in = img2[..., :3]
+                    elif img2.ndim == 3 and img2.shape[0] >= 3:
+                        # if someone stored channels-first, keep first 3 channels
+                        img_in = np.moveaxis(img2[:3, ...], 0, -1)
+                    else:
+                        img_in = img2
+
+                    # cpsam commonly returns 3 outputs (masks, flows, styles) 
+                    eval_out = model.eval(img_in, diameter=diameter_val, do_3D=False)
+                    if isinstance(eval_out, (tuple, list)) and len(eval_out) == 3:
+                        masks, flows, styles = eval_out
+                        diams = None
+                    else:
+                        masks, flows, styles, diams = eval_out
+                else:
+                    masks, flows, styles, diams = model.eval(
+                        img2,
+                        channels=channels,
+                        diameter=diameter_val,
+                        do_3D=False,
+                    )
 
                 masks = np.asarray(masks, dtype=np.int32)
                 if masks.size == 0 or int(masks.max()) == 0:
@@ -2741,11 +2770,15 @@ class UIWidget(QWidget):
             labels_layer.data = out
             n_cells = int(out.max())
 
-            # Track last-used weights (for custom mode, this is your selected file; for cpsam it's just "cpsam")
+            # Track last-used weights (for custom mode, selected file; for cpsam it's "cpsam")
             st["ml_last_trained_model_file"] = weights
 
             self._cell_counter_set_status(f"Device: {dev} | Backend: cellpose | Done ({n_cells} labels)")
-            QMessageBox.information(cc.window.qt_viewer, "ML", f"Cellpose inference complete.\nDetected (slice-stacked) objects: {n_cells}")
+            QMessageBox.information(
+                cc.window.qt_viewer,
+                "ML",
+                f"Cellpose inference complete.\nDetected (slice-stacked) objects: {n_cells}",
+            )
 
         except Exception as e:
             try:
@@ -2753,6 +2786,7 @@ class UIWidget(QWidget):
             except Exception:
                 pass
             QMessageBox.critical(self, "Error", f"Cellpose inference failed:\n{e}")
+
 
     def _torch_best_device(self):
         """Return a torch.device string: 'cuda' | 'mps' | 'cpu'."""
@@ -2917,9 +2951,9 @@ class UIWidget(QWidget):
             except Exception:
                 pass
 
-            # Create a Cellpose model starting from built-in pretrained (recommended by Cellpose docs). [page:1]
+            # Create a Cellpose model starting from built-in pretrained (recommended by Cellpose docs). 
             # We try to pass an explicit device if available; otherwise rely on gpu flag.
-            # Cellpose's internal device assignment supports CUDA and checks MPS availability. [web:479]
+            # Cellpose's internal device assignment supports CUDA and checks MPS availability. 
             try:
                 import torch
                 device_obj = torch.device(dev)
@@ -2930,7 +2964,7 @@ class UIWidget(QWidget):
             model = models.CellposeModel(gpu=gpu_flag, device=device_obj, pretrained_model="cpsam")
 
             # Train and save model
-            # train.train_seg returns model_path and losses per docs. [page:1]
+            # train.train_seg returns model_path and losses per docs. 
             model_out_path, train_losses, test_losses = train.train_seg(
                 model.net,
                 train_data=train_imgs,
@@ -2976,127 +3010,6 @@ class UIWidget(QWidget):
             except Exception:
                 pass
             QMessageBox.critical(self, "Error", f"Cellpose training failed:\n{e}")
-
-    def _cell_counter_ml_infer(self, backend="Cellpose (recommended)", device="auto", model_path=""):
-        try:
-            st = getattr(self, "_cell_counter_state", None)
-            if not st:
-                QMessageBox.warning(self, "ML", "No cell-counter session found.")
-                return
-
-            if "Cellpose" not in (backend or ""):
-                QMessageBox.warning(self, "ML", "Only Cellpose backend is implemented right now.")
-                return
-
-            cc = st["viewer"]
-            vol = np.asarray(st["vol"], dtype=np.float32)  # (Z,Y,X)
-            labels_layer = st["labels"]
-
-            dev = self._cellpose_device_from_ui(device)
-            st["ml_device"] = dev
-            st["ml_backend"] = "cellpose"
-
-            if not model_path:
-                model_path = st.get("ml_model_path", "") or ""
-            if model_path:
-                st["ml_model_path"] = model_path
-
-            # Resolve model file
-            model_file = st.get("ml_last_trained_model_file", "")
-
-            meta_file = os.path.join(model_path, "cellpose_model_meta.json") if model_path else ""
-            if (not model_file) and meta_file and os.path.exists(meta_file):
-                try:
-                    with open(meta_file, "r") as f:
-                        meta = json.load(f)
-                    model_file = meta.get("model_out_path", "") or ""
-                except Exception:
-                    model_file = ""
-
-            if not model_file or not os.path.exists(model_file):
-                # Let user pick the trained model file directly
-                model_file, _ = QFileDialog.getOpenFileName(
-                    cc.window.qt_viewer,
-                    "Select Cellpose model file",
-                    model_path or "",
-                    "All files (*)",
-                )
-                if not model_file:
-                    return
-
-            self._cell_counter_set_status(f"Device: {dev} | Backend: cellpose | Infer...")
-
-            # Build model
-            try:
-                import torch
-                device_obj = torch.device(dev)
-            except Exception:
-                device_obj = None
-            gpu_flag = (dev == "cuda" or dev == "mps")
-
-            model = models.CellposeModel(gpu=gpu_flag, device=device_obj, pretrained_model=model_file)
-
-            # Ask for key eval params
-            diameter, ok = QInputDialog.getDouble(
-                cc.window.qt_viewer,
-                "Cellpose diameter",
-                "Approx cell diameter in pixels (0 = auto):",
-                value=0.0,
-                min=0.0,
-                max=10000.0,
-                decimals=2,
-            )
-            if not ok:
-                return
-
-            # 2D-per-slice inference
-            Z = vol.shape[0]
-            out = np.zeros_like(vol, dtype=np.int32)
-            next_id = 0
-
-            # Basic channel handling: single-channel grayscale => channels=[0,0]
-            # (Cellpose uses channel indices; for grayscale you typically pass [0,0].)
-            channels = [0, 0]
-
-            for z in range(Z):
-                img2 = np.asarray(vol[z], dtype=np.float32)
-
-                masks, flows, styles, diams = model.eval(
-                    img2,
-                    channels=channels,
-                    diameter=(None if float(diameter) <= 0 else float(diameter)),
-                    do_3D=False,
-                )
-
-                masks = np.asarray(masks, dtype=np.int32)
-                if masks.size == 0 or int(masks.max()) == 0:
-                    continue
-
-                # Relabel slice so IDs are unique across Z
-                m = masks
-                unique_ids = np.unique(m)
-                unique_ids = unique_ids[unique_ids != 0]
-                if unique_ids.size:
-                    remap = {int(uid): (next_id + i + 1) for i, uid in enumerate(unique_ids)}
-                    next_id += int(unique_ids.size)
-                    m2 = np.zeros_like(m, dtype=np.int32)
-                    for uid, nid in remap.items():
-                        m2[m == uid] = nid
-                    out[z] = m2
-
-            labels_layer.data = out
-            n_cells = int(out.max())
-            st["ml_last_trained_model_file"] = model_file
-
-            self._cell_counter_set_status(f"Device: {dev} | Backend: cellpose | Done ({n_cells} labels)")
-            QMessageBox.information(cc.window.qt_viewer, "ML", f"Cellpose inference complete.\nDetected (slice-stacked) objects: {n_cells}")
-
-        except Exception as e:
-            try:
-                self._cell_counter_set_status("ML inference failed")
-            except Exception:
-                pass
-            QMessageBox.critical(self, "Error", f"Cellpose inference failed:\n{e}")
 
     def _cell_counter_ml_save(self, backend="Cellpose (recommended)", device="auto", model_path=""):
         try:
@@ -3262,12 +3175,12 @@ class UIWidget(QWidget):
             if neg_mask.any():
                 fg = fg & (~neg_mask)
 
-            # Soma-only cleanup: opening removes thin processes [web:293]
+            # Soma-only cleanup: opening removes thin processes 
             r = int(open_radius)
             if r > 0:
                 fg = binary_opening(fg, footprint=ball(r))
 
-            # Remove small junk objects (3D) [web:461]
+            # Remove small junk objects (3D) 
             fg = remove_small_objects(fg, min_size=int(min_voxels), connectivity=1)
 
             if not fg.any():
@@ -3275,11 +3188,11 @@ class UIWidget(QWidget):
                 QMessageBox.information(cc.window.qt_viewer, "Cell Counter", "No foreground after threshold/cleanup.")
                 return
 
-            # Watershed on distance transform with markers [web:292]
+            # Watershed on distance transform with markers 
             dist = ndi.distance_transform_edt(fg)
             markers = seeds.copy()
 
-            # Optional auto-split: add distance peaks as extra markers [web:8]
+            # Optional auto-split: add distance peaks as extra markers 
             if bool(auto_split):
                 coords = peak_local_max(
                     dist,
@@ -5089,7 +5002,7 @@ class UIWidget(QWidget):
             if not any(save_path.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg"]):
                 save_path += ".png"
 
-            img = viewer.screenshot(canvas_only=canvas_only)  # returns RGBA ndarray [page:1]
+            img = viewer.screenshot(canvas_only=canvas_only)  # returns RGBA ndarray 
             imageio.imwrite(save_path, img)
 
             QMessageBox.information(parent, "Saved", f"Screenshot saved to {save_path}")
