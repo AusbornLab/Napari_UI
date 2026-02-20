@@ -93,4 +93,3 @@ This activates your napari_env, where the installation of packages will be done
 
 #If you are using a mac machine then use the following command to star the user interface
 - python3.11 Napari_UI.py
-
