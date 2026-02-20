@@ -726,13 +726,13 @@ class MaskTunerDialog(QDialog):
     # ---------------- UI handlers ----------------
     def _on_z_changed(self, v):
         self.z = int(v)
-        if self.nz <= 0:
+        if getattr(self, "nz", 0) <= 0:
             return
         self.z = max(0, min(self.z, self.nz - 1))
 
         self.z_label.setText(f"{self.z}/{max(self.nz - 1, 0)}")
 
-        # Update displayed slices (2D)
+        # Update your main displayed layers
         self.img_layer.data = self.arr3[self.z]
         self.mask_layer.data = self.preview_masks[self.z]
         try:
@@ -740,7 +740,26 @@ class MaskTunerDialog(QDialog):
         except Exception:
             pass
 
+        # Update any dynamically loaded channels (2D view layers)
+        if hasattr(self, "channel_full_stacks") and hasattr(self, "channel_layers"):
+            for stack, lay in zip(self.channel_full_stacks, self.channel_layers):
+                a = np.asarray(stack)
+                if a.ndim == 3:
+                    z = max(0, min(self.z, a.shape[0] - 1))
+                    lay.data = a[z]
+                else:
+                    lay.data = a  # 2D stays 2D
+
         self._preview_current_slice()
+
+
+    def _dtype_max_value(self, dtype):
+        dt = np.dtype(dtype)
+        if np.issubdtype(dt, np.integer):
+            return int(np.iinfo(dt).max)
+        if np.issubdtype(dt, np.floating):
+            return 1.0
+        return 65535
 
     def _on_threshold_changed(self, v):
         self.threshold = int(v)
@@ -1307,6 +1326,59 @@ class UIWidget(QWidget):
 
         layout.addLayout(btns)
     
+    def _suggest_export_dtype_and_scale(self, arr):
+        """
+        Export rules (no forced uint16 fallback):
+        - Bool masks -> uint8 with values {0,1} (binary).
+        - Float masks in [0,1] -> uint8 with values {0,1} (binary), preserving mask semantics.
+        - Integer images -> preserve dtype exactly (uint8/uint16/int16/etc).
+        Note: “12-bit” camera data is almost always stored in a uint16 container in TIFF,
+        so dtype will still be uint16; you cannot reliably infer “12-bit” vs “16-bit”
+        from the NumPy dtype alone unless you saved that metadata somewhere 
+        - Float intensity (not mask-like) -> keep float32 (no scaling), to avoid inventing a bit depth.
+
+        Returns: (out_arr, out_dtype, suggested_contrast_limits)
+        """
+        a = np.asarray(arr)
+
+        # ---------- Bool mask: export as binary 0/1 ----------
+        if a.dtype == np.bool_:
+            out = a.astype(np.uint8)  # 0 or 1
+            return out, out.dtype, (0, 1)
+
+        # ---------- Integer images: preserve dtype ----------
+        if np.issubdtype(a.dtype, np.integer):
+            out = a  # keep exactly
+            info = np.iinfo(out.dtype)
+            return out, out.dtype, (int(info.min), int(info.max))
+
+        # ---------- Float data ----------
+        if np.issubdtype(a.dtype, np.floating):
+            finite = a[np.isfinite(a)]
+            if finite.size == 0:
+                out = a.astype(np.float32, copy=False)
+                return out, out.dtype, (0.0, 1.0)
+
+            amin = float(finite.min())
+            amax = float(finite.max())
+
+            # Mask-like float (0..1): export as binary 0/1 (uint8)
+            # If you want to preserve probabilistic masks, change this to float32 passthrough.
+            if amin >= -1e-6 and amax <= 1.0 + 1e-6:
+                out = (a > 0).astype(np.uint8)  # binary
+                return out, out.dtype, (0, 1)
+
+            # Float intensity: do NOT guess 8/12/16-bit. Preserve as float32.
+            # This avoids silently rescaling and changing quantitative values.
+            out = a.astype(np.float32, copy=False)
+            return out, out.dtype, (amin, amax)
+
+        # ---------- Unknown dtype fallback: preserve if possible ----------
+        # (e.g., complex -> float32 magnitude; adjust if you have such data)
+        out = np.asarray(a)
+        return out, out.dtype, (float(np.nanmin(out)), float(np.nanmax(out)))
+
+
     def _set_slider_from_lineedit(self, lineedit, slider, lo, hi):
         try:
             val = int(lineedit.text())
@@ -1567,23 +1639,43 @@ class UIWidget(QWidget):
         vlay.addLayout(top_h)
 
         # ----------------------------------------------------------
-        # Simple MIN/MAX CONTRAST LIMIT SLIDERS (napari-native)
+        # MIN/MAX CONTRAST LIMIT SLIDERS
         # ----------------------------------------------------------
         lim = self.contrast_limits.get(f"ch{idx}", (0, max_range))
+
+        # Decide if this channel is "mask-like" (0..1)
+        is_unit_float = False
+        try:
+            lo0, hi0 = float(lim[0]), float(lim[1])
+            is_unit_float = (lo0 >= -1e-6 and hi0 <= 1.0 + 1e-6 and max_range == 1)
+        except Exception:
+            pass
+
+        def to_slider(val):
+            # If using max_range==1 we keep 0/1 integer slider
+            if max_range <= 1:
+                return int(round(float(val)))
+            return int(round(float(val)))
+
+        def from_slider(v):
+            # If max_range==1, return float 0.0/1.0 for napari
+            if max_range <= 1:
+                return float(v)
+            return float(v)
 
         # Min
         ch_min_layout = QHBoxLayout()
         ch_min_layout.addWidget(QLabel("Min:"))
         ch_min = QSlider(Qt.Horizontal)
-        ch_min.setRange(0, max_range)
-        ch_min.setValue(int(lim[0]))
+        ch_min.setRange(0, int(max_range))
+        ch_min.setValue(to_slider(lim[0]))
         ch_min_layout.addWidget(ch_min)
 
-        ch_min_val = QLineEdit(str(int(lim[0])))
+        ch_min_val = QLineEdit(str(to_slider(lim[0])))
         ch_min_val.setFixedWidth(80)
-        ch_min_val.setValidator(QIntValidator(0, max_range))
+        ch_min_val.setValidator(QIntValidator(0, int(max_range)))
         ch_min_val.editingFinished.connect(
-            lambda le=ch_min_val, sl=ch_min: self._set_slider_from_lineedit(le, sl, 0, max_range)
+            lambda le=ch_min_val, sl=ch_min: self._set_slider_from_lineedit(le, sl, 0, int(max_range))
         )
         ch_min_layout.addWidget(ch_min_val)
         vlay.addLayout(ch_min_layout)
@@ -1592,40 +1684,44 @@ class UIWidget(QWidget):
         ch_max_layout = QHBoxLayout()
         ch_max_layout.addWidget(QLabel("Max:"))
         ch_max = QSlider(Qt.Horizontal)
-        ch_max.setRange(0, max_range)
-        ch_max.setValue(int(lim[1]))
+        ch_max.setRange(0, int(max_range))
+        ch_max.setValue(to_slider(lim[1]))
         ch_max_layout.addWidget(ch_max)
 
-        ch_max_val = QLineEdit(str(int(lim[1])))
+        ch_max_val = QLineEdit(str(to_slider(lim[1])))
         ch_max_val.setFixedWidth(80)
-        ch_max_val.setValidator(QIntValidator(0, max_range))
+        ch_max_val.setValidator(QIntValidator(0, int(max_range)))
         ch_max_val.editingFinished.connect(
-            lambda le=ch_max_val, sl=ch_max: self._set_slider_from_lineedit(le, sl, 0, max_range)
+            lambda le=ch_max_val, sl=ch_max: self._set_slider_from_lineedit(le, sl, 0, int(max_range))
         )
         ch_max_layout.addWidget(ch_max_val)
         vlay.addLayout(ch_max_layout)
 
-        # --- update napari contrast limits ---
         def _apply_contrast_from_sliders(_=None, lyr=layer,
                                         smin=ch_min, smax=ch_max,
                                         le_min=ch_min_val, le_max=ch_max_val):
-            lo = int(smin.value())
-            hi = int(smax.value())
+            lo_i = int(smin.value())
+            hi_i = int(smax.value())
 
-            if hi < lo:
-                hi = lo
+            if hi_i < lo_i:
+                hi_i = lo_i
                 smax.blockSignals(True)
-                smax.setValue(hi)
+                smax.setValue(hi_i)
                 smax.blockSignals(False)
 
-            # keep text boxes synced
-            le_min.setText(str(lo))
-            le_max.setText(str(hi))
+            le_min.setText(str(lo_i))
+            le_max.setText(str(hi_i))
+
+            lo = from_slider(lo_i)
+            hi = from_slider(hi_i)
 
             try:
                 lyr.contrast_limits = (lo, hi)
             except Exception:
                 pass
+
+            # Keep internal dict in the same float domain napari uses
+            self.contrast_limits[f"ch{idx}"] = (lo, hi)
 
         ch_min.valueChanged.connect(_apply_contrast_from_sliders)
         ch_max.valueChanged.connect(_apply_contrast_from_sliders)
@@ -1645,6 +1741,7 @@ class UIWidget(QWidget):
             "groupbox": gb,
         }
         return gb, ctrl
+
 
     def open_analysis(self):
         # Keep a reference so dialog doesn't get garbage-collected
@@ -3233,6 +3330,7 @@ class UIWidget(QWidget):
         Export a CSV with per-cell fluorescence intensity stats from a chosen 3D Image layer
         in the Cell Counter viewer (one channel at a time):
         - Cell # (1..N)
+        - pixel_count (number of voxels/pixels in the label, including zeros in intensity)
         - min (excluding zeros)
         - max (excluding zeros)
         - average (mean, excluding zeros)
@@ -3261,22 +3359,16 @@ class UIWidget(QWidget):
             # ---------------------------------------------------------
             candidates = []  # list of (name, layer)
             for lyr in cc.layers:
-                # Must have data
                 if not hasattr(lyr, "data"):
                     continue
-
-                # Never allow measuring intensities from the Labels layer itself
-                # (Labels are integer IDs per pixel/voxel) 
                 if lyr is labels_layer or lyr.__class__.__name__.lower() == "labels":
                     continue
 
-                # Must be array-like and shape-match labels
                 try:
                     arr = np.asarray(lyr.data)
                 except Exception:
                     continue
 
-                # We only support 3D scalar volumes here
                 if arr.ndim != 3:
                     continue
                 if arr.shape != lab.shape:
@@ -3295,11 +3387,8 @@ class UIWidget(QWidget):
                 )
                 return
 
-            # Default to 'Detection input' if present
             names = [nm for nm, _ in candidates]
-            default_index = 0
-            if "Detection input" in names:
-                default_index = names.index("Detection input")
+            default_index = names.index("Detection input") if "Detection input" in names else 0
 
             chosen_name, ok = QInputDialog.getItem(
                 cc.window.qt_viewer,
@@ -3315,7 +3404,6 @@ class UIWidget(QWidget):
             chosen_layer = dict(candidates)[chosen_name]
             vol = np.asarray(chosen_layer.data, dtype=np.float32)
 
-            # Final guard
             if vol.ndim != 3 or vol.shape != lab.shape:
                 QMessageBox.warning(
                     cc.window.qt_viewer,
@@ -3351,14 +3439,19 @@ class UIWidget(QWidget):
                 save_path += ".csv"
 
             # ---------------------------------------------------------
-            # 3) Compute per-cell stats (exclude zeros)
+            # 3) Compute per-cell stats + pixel counts
             # ---------------------------------------------------------
+            # Fast pixel/voxel counts per label id:
+            # bincount counts occurrences of each integer value in the flattened label image 
+            counts = np.bincount(lab.ravel().astype(np.int64), minlength=n_cells + 1)
+
             rows = []
             for cell_id in range(1, n_cells + 1):
-                m = (lab == cell_id)
-                if not np.any(m):
+                pixel_count = int(counts[cell_id])  # number of labeled voxels for this cell
+                if pixel_count <= 0:
                     continue
 
+                m = (lab == cell_id)
                 vals = vol[m]
                 vals = vals[vals > 0]  # exclude 0 background
 
@@ -3371,15 +3464,16 @@ class UIWidget(QWidget):
                     max_v = float(vals.max())
                     mean_v = float(vals.mean())
 
-                rows.append((cell_id, min_v, max_v, mean_v))
+                rows.append((cell_id, pixel_count, min_v, max_v, mean_v))
 
             if not rows:
-                QMessageBox.information(cc.window.qt_viewer, "Cell Counter", "No cells had non-zero intensity pixels.")
+                QMessageBox.information(cc.window.qt_viewer, "Cell Counter", "No cells found to export.")
                 return
 
             with open(save_path, "w", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["Cell #", "min", "max", "average"])
+                # Python's csv module writes Excel-friendly CSVs when opened with newline='' 
+                w.writerow(["Cell #", "pixel_count", "min", "max", "average"])
                 w.writerows(rows)
 
             print(f"Exported intensities for {len(rows)} cells from layer '{chosen_name}' to: {save_path}")
@@ -3391,6 +3485,7 @@ class UIWidget(QWidget):
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Intensity export failed:\n{e}")
+
 
     def open_preprocess(self):
         self_parent = self
@@ -3745,71 +3840,80 @@ class UIWidget(QWidget):
                 mmaps, clims, vox, temp = load_tiff_memmap(p, max_ch=4)
 
             # Ensure lists exist
-            if not hasattr(self, "channel_list") or self.channel_list is None:
-                self.channel_list = []
-            if not hasattr(self, "channel_layers") or self.channel_layers is None:
-                self.channel_layers = []
-            if not hasattr(self, "channel_controls") or self.channel_controls is None:
-                self.channel_controls = []
+            self.channel_list = getattr(self, "channel_list", []) or []
+            self.channel_layers = getattr(self, "channel_layers", []) or []
+            self.channel_controls = getattr(self, "channel_controls", []) or []
+            self.channel_full_stacks = getattr(self, "channel_full_stacks", []) or []
 
-            # Update contrast_limits dict with any new ones we got
-            if isinstance(clims, dict):
-                # NOTE: clims keys might be "ch1/ch2" relative to the loaded file.
-                # We'll set defaults for new global indices below anyway.
-                pass
+            if not hasattr(self, "contrast_limits") or self.contrast_limits is None:
+                self.contrast_limits = {}
 
-            # determine slider max range from existing + new clims
-            max_range = 65535
-            try:
-                vals = []
-                if isinstance(getattr(self, "contrast_limits", None), dict):
-                    vals += [int(v[1]) for v in self.contrast_limits.values() if isinstance(v, (tuple, list)) and len(v) == 2]
-                if isinstance(clims, dict):
-                    vals += [int(v[1]) for v in clims.values() if isinstance(v, (tuple, list)) and len(v) == 2]
-                if vals:
-                    mr = max(vals)
-                    max_range = max(1000, min(mr * 2, 65535))
-            except Exception:
-                pass
+            # Choose initial z
+            # (If you already track self.z somewhere, keep it; else default 0)
+            self.z = int(getattr(self, "z", 0))
 
-            # Append new channels
             start_idx = len(self.channel_list)  # 0-based count before adding
+
             for j, ch in enumerate(mmaps):
                 new_idx = start_idx + j + 1  # 1-based channel number for naming
 
+                stack = np.asarray(ch)
+                self.channel_full_stacks.append(stack)
                 self.channel_list.append(ch)
 
-                # Add layer to viewer (do NOT clear existing)
-                lay = self.viewer.add_image(ch, name=f"Channel {new_idx}", opacity=1.0)
+                # Determine nz from this stack (assume ZYX if 3D)
+                nz = stack.shape[0] if stack.ndim == 3 else 1
+                z0 = int(max(0, min(self.z, nz - 1)))
+
+                # Create a 2D view for the layer (so your _on_z_changed can keep working)
+                view2d = stack[z0] if stack.ndim == 3 else stack
+
+                lay = self.viewer.add_image(view2d, name=f"Channel {new_idx}", opacity=1.0)
                 self.channel_layers.append(lay)
 
-                # Set default contrast_limits entry for this new channel if missing
-                if not hasattr(self, "contrast_limits") or self.contrast_limits is None:
-                    self.contrast_limits = {}
-                if f"ch{new_idx}" not in self.contrast_limits:
-                    # try to use clims from loaded file (best-effort), else fallback
-                    guess = None
-                    if isinstance(clims, dict):
-                        guess = clims.get(f"ch{j+1}", None)
-                    self.contrast_limits[f"ch{new_idx}"] = guess if guess else (0, max_range)
+                # Pick contrast limits: prefer saved clims if provided, else compute from data
+                guess = None
+                if isinstance(clims, dict):
+                    guess = clims.get(f"ch{j+1}", None)
 
-                # Add UI controls for the new channel
-                gb, ctrl = self._add_channel_controls(lay, new_idx, max_range=max_range)
+                lo, hi, slider_max = self._compute_channel_display_range(stack)
+
+                # If we got a guess, use it; otherwise use computed lo/hi
+                if guess and isinstance(guess, (tuple, list)) and len(guess) == 2:
+                    self.contrast_limits[f"ch{new_idx}"] = (float(guess[0]), float(guess[1]))
+                else:
+                    self.contrast_limits[f"ch{new_idx}"] = (float(lo), float(hi))
+
+                # Apply to napari layer
+                try:
+                    lay.contrast_limits = tuple(self.contrast_limits[f"ch{new_idx}"])
+                except Exception:
+                    pass
+
+                # Build per-channel UI controls with a channel-specific max_range
+                # (Your sliders are int-based; map float masks to 0..1 slider_max=1.)
+                gb, ctrl = self._add_channel_controls(lay, new_idx, max_range=int(slider_max))
                 self.channel_controls.append(ctrl)
-
-                # Put the groupbox somewhere sensible:
-                # simplest: add at end of main layout
                 self.layout().insertWidget(self.layout().count() - 1, gb)
 
-            # Update n_z and z slider range based on first channel (your app’s convention)
-            first = np.asarray(self.channel_list[0])
-            self.n_z = first.shape[0] if first.ndim == 3 else 1
-            self.z_slider.setRange(0, max(self.n_z - 1, 0))
+            # Update global nz for the Z slider based on the *first* loaded stack
+            first_stack = np.asarray(self.channel_full_stacks[0])
+            self.nz = first_stack.shape[0] if first_stack.ndim == 3 else 1
+
+            self.z_slider.setRange(0, max(self.nz - 1, 0))
+            self.z = int(max(0, min(self.z, self.nz - 1)))
+            self.z_slider.blockSignals(True)
+            self.z_slider.setValue(self.z)
+            self.z_slider.blockSignals(False)
 
             # Track temp paths
             self._temp_paths = getattr(self, "_temp_paths", []) + (temp or [])
 
-            QMessageBox.information(self, "Loaded", f"Added {len(mmaps)} channels (now {len(self.channel_list)} total).")
+            QMessageBox.information(
+                self,
+                "Loaded",
+                f"Added {len(mmaps)} channels (now {len(self.channel_list)} total).",
+            )
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load channels: {e}")
@@ -3823,8 +3927,12 @@ class UIWidget(QWidget):
                 return
 
             names = [lyr.name for lyr in img_layers]
-            txt, ok = QInputDialog.getText(self, "Export", f"Enter comma-separated layer numbers to export (1-{len(names)}):\n" +
-                                        "\n".join([f"{i+1}: {n}" for i, n in enumerate(names)]))
+            txt, ok = QInputDialog.getText(
+                self,
+                "Export",
+                f"Enter comma-separated layer numbers to export (1-{len(names)}):\n"
+                + "\n".join([f"{i+1}: {n}" for i, n in enumerate(names)]),
+            )
             if not ok or not txt:
                 return
 
@@ -3837,13 +3945,50 @@ class UIWidget(QWidget):
                 i = n - 1
                 if i < 0 or i >= len(img_layers):
                     continue
+
                 lyr = img_layers[i]
                 arr = np.asarray(lyr.data)
+
+                # IMPORTANT: export the full stack (all z) if present
+                # (arr is already the full layer data; just don't slice it here.)
+
+                out_arr, out_dtype, _clims = self._suggest_export_dtype_and_scale(arr)
+
                 out_path = Path(out_dir) / f"{Path(self.file_path).stem}_{lyr.name}.tif"
-                tifffile.imwrite(str(out_path), arr)
+
+                # Write with explicit photometric; tifffile preserves dtype on write
+                tifffile.imwrite(
+                    str(out_path),
+                    out_arr,
+                    photometric="minisblack",
+                )
+
             QMessageBox.information(self, "Exported", "Selected layers exported.")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Export failed: {e}")
+
+    def _compute_channel_display_range(self, arr):
+        """Return (lo, hi, slider_max) for UI/contrast based on dtype and data."""
+        a = np.asarray(arr)
+        if np.issubdtype(a.dtype, np.integer):
+            hi = int(np.iinfo(a.dtype).max)
+            return 0, hi, hi
+
+        # float: if looks like mask, use 0..1 else use robust max
+        finite = a[np.isfinite(a)]
+        if finite.size == 0:
+            return 0.0, 1.0, 1
+
+        amin = float(finite.min())
+        amax = float(finite.max())
+
+        if amin >= -1e-6 and amax <= 1.0 + 1e-6:
+            return 0.0, 1.0, 1
+
+        # intensity float: choose slider max as ceil(max) but capped
+        # (you can change the cap if you want bigger floats)
+        slider_max = int(min(max(1000, np.ceil(amax)), 65535))
+        return float(amin), float(amax), slider_max
 
     def _pick_layer_name(self, title, prompt, layer_names):
         name, ok = QInputDialog.getItem(self, title, prompt, layer_names, 0, False)
