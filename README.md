@@ -23,15 +23,15 @@ brew install git
 
 ### Setup of python ###
 
-The current version of python that is used for this is 3.13.2.
+The current version of python that is used for this is 3.11.9.
 It has only been tested with this version, and therefore has dependcy requirements using this version. 
-Using Python versions prior to 3.13 (3.11 or older specifically may cause compatibility errors)
+Using Python 3.12 or older packages may cause compatibility errors.
 
 Python can be downloaded from the following website
-https://www.python.org/downloads/release/python-31312/
+https://www.python.org/downloads/release/python-3119/
 
 
-### Pulling the github repository
+### Pulling the github repository ###
 To pull the current version of the repository generate a folder in your directory
  - Navigate to that directory in a command prompt, or use a simple IDE like Visual Studio Code (https://code.visualstudio.com/download)
  - run the following command in the terminal
@@ -58,7 +58,7 @@ Once python 3.11.9 is installed the following packages and versions must be inst
 
 ########################
 
-Activation of the virtual environment
+### Activation of the virtual environment ###
 - In your napari_UI folder a new folder named napari_env should be there now.
 
 #If you are using a windows machine use the following commands in the command terminal
@@ -76,10 +76,12 @@ This activates your napari_env, where the installation of packages will be done
 
 ########################
 
-Installation of packages
+### Installation of packages ###
+
 - use the following command to install the packages to your virtual env from the requirements.txt file 
-#The following command works with both mac and windowx machines
-- pip install -r requirements.txt
+#The following command works with both mac and windows machines
+- pip install -r requirements.txt (for windows)
+- pip install -r requirements_mac.txt (for mac systems)
 
 ########################
 
@@ -92,5 +94,3 @@ Installation of packages
 #If you are using a mac machine then use the following command to star the user interface
 - python3.11 Napari_UI.py
 
-
-### C
