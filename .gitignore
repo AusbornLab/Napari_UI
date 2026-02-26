@@ -6,3 +6,5 @@ env/
 __pycache__/
 napari_env/
 models/
+meta_data
+napari_mmap_files

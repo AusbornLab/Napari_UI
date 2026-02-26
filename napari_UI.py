@@ -3339,7 +3339,7 @@ class UIWidget(QWidget):
     def calculate_intensities_per_cell(self):
         """
         Export a CSV with per-cell fluorescence intensity stats from a chosen 3D Image layer
-        in the Cell Counter viewer (one channel at a time):
+        in the Cell Counter viewer or the main viewer (one channel at a time):
         - Cell # (1..N)
         - pixel_count (number of voxels/pixels in the label, including zeros in intensity)
         - min (excluding zeros)
@@ -3352,40 +3352,85 @@ class UIWidget(QWidget):
                 QMessageBox.warning(self, "Cell Counter", "No cell-counter session found.")
                 return
 
-            cc = st["viewer"]
+            cc = st["viewer"]          # cell counter viewer
             labels_layer = st["labels"]
             lab = np.asarray(labels_layer.data)  # 0=background
 
             if lab.ndim != 3:
-                QMessageBox.warning(cc.window.qt_viewer, "Cell Counter", "Detected cells layer must be 3D.")
+                QMessageBox.warning(
+                    cc.window.qt_viewer,
+                    "Cell Counter",
+                    "Detected cells layer must be 3D.",
+                )
                 return
 
             n_cells = int(lab.max())
             if n_cells <= 0:
-                QMessageBox.information(cc.window.qt_viewer, "Cell Counter", "No detected cells to export.")
+                QMessageBox.information(
+                    cc.window.qt_viewer,
+                    "Cell Counter",
+                    "No detected cells to export.",
+                )
                 return
 
             # ---------------------------------------------------------
-            # 1) Collect candidate intensity source layers (3D Images)
+            # 0) Choose where to take intensities from
             # ---------------------------------------------------------
-            candidates = []  # list of (name, layer)
-            for lyr in cc.layers:
-                if not hasattr(lyr, "data"):
-                    continue
-                if lyr is labels_layer or lyr.__class__.__name__.lower() == "labels":
-                    continue
+            source_choice, ok = QInputDialog.getItem(
+                cc.window.qt_viewer,
+                "Intensity source",
+                "Select where to get intensities:",
+                ["Cell Counter viewer", "Main viewer"],
+                0,
+                False,
+            )
+            if not ok or not source_choice:
+                return
 
-                try:
-                    arr = np.asarray(lyr.data)
-                except Exception:
-                    continue
+            # Helper to collect candidates from a given viewer
+            def _collect_candidates(viewer, labels_shape, labels_layer_to_exclude=None):
+                cands = []
+                for lyr in viewer.layers:
+                    if not hasattr(lyr, "data"):
+                        continue
+                    if lyr is labels_layer_to_exclude or getattr(lyr, "data", None) is None:
+                        continue
+                    # skip labels-type layers
+                    if lyr.__class__.__name__.lower() == "labels":
+                        continue
+                    try:
+                        arr = np.asarray(lyr.data)
+                    except Exception:
+                        continue
+                    if arr.ndim != 3:
+                        continue
+                    if arr.shape != labels_shape:
+                        continue
+                    cands.append((getattr(lyr, "name", "image"), lyr))
+                return cands
 
-                if arr.ndim != 3:
-                    continue
-                if arr.shape != lab.shape:
-                    continue
+            # ---------------------------------------------------------
+            # 1) Collect candidate intensity layers
+            # ---------------------------------------------------------
+            if source_choice == "Cell Counter viewer":
+                intensity_viewer = cc
+            else:
+                # assume you stored the main viewer on self, adapt if needed
+                main_viewer = getattr(self, "viewer", None)
+                if main_viewer is None:
+                    QMessageBox.warning(
+                        cc.window.qt_viewer,
+                        "Cell Counter",
+                        "Main viewer not available on this plugin instance.",
+                    )
+                    return
+                intensity_viewer = main_viewer
 
-                candidates.append((getattr(lyr, "name", "image"), lyr))
+            candidates = _collect_candidates(
+                intensity_viewer,
+                labels_shape=lab.shape,
+                labels_layer_to_exclude=labels_layer if intensity_viewer is cc else None,
+            )
 
             if not candidates:
                 QMessageBox.warning(
@@ -3393,8 +3438,8 @@ class UIWidget(QWidget):
                     "Cell Counter",
                     "No valid 3D Image layers found that match the labels shape.\n"
                     f"Labels shape: {lab.shape}\n\n"
-                    "Tip: In your Cell Counter viewer, ensure the fluorescence volume you want to measure\n"
-                    "is present as a 3D Image layer with the same (Z,Y,X) shape."
+                    "Tip: Ensure the fluorescence volume you want to measure is present\n"
+                    "as a 3D Image layer with the same (Z,Y,X) shape.",
                 )
                 return
 
@@ -3407,7 +3452,7 @@ class UIWidget(QWidget):
                 "Select the 3D Image layer to measure intensities from:",
                 names,
                 default_index,
-                False
+                False,
             )
             if not ok or not chosen_name:
                 return
@@ -3420,9 +3465,18 @@ class UIWidget(QWidget):
                     cc.window.qt_viewer,
                     "Cell Counter",
                     f"Selected layer does not match labels shape.\n"
-                    f"Image shape: {vol.shape}, Labels shape: {lab.shape}"
+                    f"Image shape: {vol.shape}, Labels shape: {lab.shape}",
                 )
                 return
+
+            # ---------------------------------------------------------
+            # 1b) If intensity comes from main viewer, apply mask
+            # ---------------------------------------------------------
+            if source_choice == "Main viewer":
+                # binary mask (0/1) from labels (non-zero voxels are 1)
+                mask = (lab > 0).astype(np.float32)
+                # multiply mask into the chosen intensity channel
+                vol = vol * mask
 
             # ---------------------------------------------------------
             # 2) Choose output file
@@ -3431,7 +3485,7 @@ class UIWidget(QWidget):
                 cc.window.qt_viewer,
                 "CSV name",
                 "Enter output CSV filename (without extension):",
-                text="cell_intensities"
+                text="cell_intensities",
             )
             if not ok:
                 return
@@ -3442,7 +3496,7 @@ class UIWidget(QWidget):
                 cc.window.qt_viewer,
                 "Save cell intensities CSV",
                 default_name,
-                "CSV files (*.csv)"
+                "CSV files (*.csv)",
             )
             if not save_path:
                 return
@@ -3452,13 +3506,11 @@ class UIWidget(QWidget):
             # ---------------------------------------------------------
             # 3) Compute per-cell stats + pixel counts
             # ---------------------------------------------------------
-            # Fast pixel/voxel counts per label id:
-            # bincount counts occurrences of each integer value in the flattened label image 
             counts = np.bincount(lab.ravel().astype(np.int64), minlength=n_cells + 1)
 
             rows = []
             for cell_id in range(1, n_cells + 1):
-                pixel_count = int(counts[cell_id])  # number of labeled voxels for this cell
+                pixel_count = int(counts[cell_id])  # labeled voxels for this cell
                 if pixel_count <= 0:
                     continue
 
@@ -3478,24 +3530,34 @@ class UIWidget(QWidget):
                 rows.append((cell_id, pixel_count, min_v, max_v, mean_v))
 
             if not rows:
-                QMessageBox.information(cc.window.qt_viewer, "Cell Counter", "No cells found to export.")
+                QMessageBox.information(
+                    cc.window.qt_viewer,
+                    "Cell Counter",
+                    "No cells found to export.",
+                )
                 return
 
             with open(save_path, "w", newline="") as f:
                 w = csv.writer(f)
-                # Python's csv module writes Excel-friendly CSVs when opened with newline='' 
                 w.writerow(["Cell #", "pixel_count", "min", "max", "average"])
                 w.writerows(rows)
 
-            print(f"Exported intensities for {len(rows)} cells from layer '{chosen_name}' to: {save_path}")
+            print(
+                f"Exported intensities for {len(rows)} cells from layer "
+                f"'{chosen_name}' (source: {source_choice}) to: {save_path}"
+            )
             QMessageBox.information(
                 cc.window.qt_viewer,
                 "Cell Counter",
-                f"Exported {len(rows)} cells.\nLayer: {chosen_name}\nSaved to:\n{save_path}"
+                f"Exported {len(rows)} cells.\n"
+                f"Layer: {chosen_name}\n"
+                f"Source: {source_choice}\n"
+                f"Saved to:\n{save_path}",
             )
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Intensity export failed:\n{e}")
+
 
 
     def open_preprocess(self):
