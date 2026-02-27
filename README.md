@@ -1,7 +1,10 @@
 General outline and flow for using Napari and the user interface (UI) developed by Anthony Moreno-Sanchez.
 
 The current code and UI, has been setup to handle up to four channels, has both capabilities for handling TIFF files and LIF (Leica) files.
-The purpose of this code is a simple UI to be able to load in imaging data for quick analysis. Simple functionality has been added to visualize channel data similar to Imaris/Fiji, but with a bit more control to the user. 
+The purpose of this code is a simple UI to be able to load in imaging data for quick analysis. Simple functionality has been added to visualize channel data similar to Imaris/Fiji, but with a bit more control to the user. This current pipeline generates temporary memmory mapped files from your image stacks as .dat files, similar to how FIJI loads in large image stacks. All analysis is does on these memory mapped file which will be stored in a folder labeled "napari_mmap_files" a folder which will be made automatocailly after loading in an image stack. 
+
+**Note: all analysis and functionality has been tested to work with a minimum system requirements: Intel I5 cpu, 16GB RAM, integrated Intel graphics, systems with higher specs will perform better and faster, on low systems very large image stacks at high resolution will have limited computational abilities, image stacks up ~300 z slices with resolution of 2600 x2600 has been tested and has full computational abilites, higher resolution will most likely require better specs **
+
 
 This current version of the pipeline includes slider controls for z stacks, opacity, brightness, contrast sliders for individual channels. 
 The interface includes analysis pipelines for mask generation of individual channels, colocalcaization between channels , a cell counter, and intensity calculations from individual cells bodies.
