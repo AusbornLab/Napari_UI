@@ -1,4 +1,6 @@
 General outline and flow for using Napari and the user interface (UI) developed by Anthony Moreno-Sanchez.
+The interface is setup on top of Napari (https://napari.org/stable/) the image viewer software, I have not developed the viewer itself, however have set it up with basic functionality that can be adjusted to include other independent analysis a user wants to integrate. 
+All functionality is tied to the individual panel on the right side of the interface, using the open analysis buttons, 
 
 The current code and UI, has been setup to handle up to four channels, has both capabilities for handling TIFF files and LIF (Leica) files.
 The purpose of this code is a simple UI to be able to load in imaging data for quick analysis. Simple functionality has been added to visualize channel data similar to Imaris/Fiji, but with a bit more control to the user. This current pipeline generates temporary memmory mapped files from your image stacks as .dat files, similar to how FIJI loads in large image stacks. All analysis is does on these memory mapped file which will be stored in a folder labeled "napari_mmap_files" a folder which will be made automatocailly after loading in an image stack. 
