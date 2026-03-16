@@ -1945,6 +1945,310 @@ class UIWidget(QWidget):
             import traceback
             traceback.print_exc()
 
+    def _cell_counter_safe_stem(self, text):
+        text = str(text).strip() if text is not None else "unnamed"
+        text = Path(text).stem
+        text = re.sub(r"[^\w\-.]+", "_", text)
+        return text or "unnamed"
+
+
+    def _cell_counter_extract_channel_number(self, src_layer):
+        try:
+            md = getattr(src_layer, "metadata", {}) or {}
+            ch_num = md.get("channel_number", None)
+            if ch_num is not None:
+                return int(ch_num)
+        except Exception:
+            pass
+
+        try:
+            nm = str(getattr(src_layer, "name", "") or "")
+            m = re.search(r"Channel\s*(\d+)", nm, flags=re.IGNORECASE)
+            if m:
+                return int(m.group(1))
+        except Exception:
+            pass
+
+        return 1
+
+
+    def _cell_counter_get_source_file_path(self):
+        """
+        Prefer the same file source used by your working channel metadata save/load.
+        """
+        try:
+            fp = getattr(self, "file_path", None)
+            if fp:
+                return Path(fp)
+        except Exception:
+            pass
+
+        try:
+            fp = getattr(self, "current_file_path", None)
+            if fp:
+                return Path(fp)
+        except Exception:
+            pass
+
+        try:
+            st = getattr(self, "_cell_counter_state", {}) or {}
+            src_layer = st.get("source_main_layer", None)
+            if src_layer is not None:
+                md = getattr(src_layer, "metadata", {}) or {}
+                fp = (
+                    md.get("path")
+                    or md.get("file_path")
+                    or md.get("source_file")
+                    or md.get("filename")
+                )
+                if fp:
+                    return Path(fp)
+        except Exception:
+            pass
+
+        return None
+
+
+    def _cell_counter_roi_json_path(self):
+        st = getattr(self, "_cell_counter_state", {}) or {}
+        src_layer = st.get("source_main_layer", None)
+
+        channel_num = self._cell_counter_extract_channel_number(src_layer)
+        src_path = self._cell_counter_get_source_file_path()
+
+        if src_path is None:
+            raise FileNotFoundError(
+                "Could not resolve source file path for ROI metadata. "
+                "Make sure self.file_path is set."
+            )
+
+        metadata_dir = Path("meta_data")
+        metadata_dir.mkdir(exist_ok=True)
+
+        json_filename = f"{src_path.stem}_Channel_{channel_num}_ROIs.json"
+        return metadata_dir / json_filename
+
+
+    def _cell_counter_shapes_to_list(self, layer):
+        out = []
+
+        try:
+            data_list = list(layer.data) if getattr(layer, "data", None) is not None else []
+        except Exception:
+            data_list = []
+
+        try:
+            shape_types = list(getattr(layer, "shape_type", []))
+        except Exception:
+            try:
+                shape_types = list(getattr(layer, "shape_types", []))
+            except Exception:
+                shape_types = []
+
+        for i, verts in enumerate(data_list):
+            arr = np.asarray(verts, dtype=float)
+            if arr.ndim != 2 or arr.shape[0] < 2:
+                continue
+
+            shape_type = shape_types[i] if i < len(shape_types) else "polygon"
+
+            out.append({
+                "shape_type": str(shape_type),
+                "vertices": arr.tolist(),
+            })
+
+        return out
+
+
+    def _cell_counter_clear_shapes_layer(self, layer):
+        try:
+            layer.selected_data = set(range(len(layer.data)))
+        except Exception:
+            pass
+
+        try:
+            layer.remove_selected()
+            return
+        except Exception:
+            pass
+
+        try:
+            layer.data = []
+        except Exception:
+            pass
+
+
+    def _cell_counter_load_shapes_from_list(self, layer, items):
+        self._cell_counter_clear_shapes_layer(layer)
+
+        if not items:
+            try:
+                layer.visible = True
+                layer.refresh()
+            except Exception:
+                pass
+            return []
+
+        loaded_z = []
+
+        for item in items:
+            try:
+                verts = np.asarray(item.get("vertices", []), dtype=float)
+                shape_type = str(item.get("shape_type", "polygon"))
+
+                if verts.ndim != 2 or verts.shape[0] < 2:
+                    continue
+
+                if verts.shape[1] == 2:
+                    z_now = 0
+                    try:
+                        viewer = getattr(self, "_cell_counter_state", {}).get("viewer", None)
+                        if viewer is not None and hasattr(viewer, "dims") and len(viewer.dims.point) > 0:
+                            z_now = int(viewer.dims.point[0])
+                    except Exception:
+                        z_now = 0
+                    verts = np.c_[np.full((verts.shape[0], 1), z_now), verts]
+
+                layer.add(verts, shape_type=shape_type)
+
+                if verts.shape[1] >= 3:
+                    try:
+                        loaded_z.append(int(round(float(verts[0, 0]))))
+                    except Exception:
+                        pass
+
+            except Exception:
+                continue
+
+        try:
+            layer.visible = True
+        except Exception:
+            pass
+
+        try:
+            layer.refresh()
+        except Exception:
+            pass
+
+        return loaded_z
+
+
+    def _cell_counter_save_roi_metadata(self):
+        st = getattr(self, "_cell_counter_state", None)
+        if not st:
+            QMessageBox.warning(self, "ROI metadata", "Cell counter state not found.")
+            return
+
+        try:
+            out_path = self._cell_counter_roi_json_path()
+            src_path = self._cell_counter_get_source_file_path()
+
+            payload = {
+                "original_file": str(src_path) if src_path is not None else "",
+                "channel_number": self._cell_counter_extract_channel_number(
+                    st.get("source_main_layer", None)
+                ),
+                "positive_rois": self._cell_counter_shapes_to_list(st["pos_shapes"]),
+                "negative_rois": self._cell_counter_shapes_to_list(st["neg_shapes"]),
+            }
+
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=4)
+
+            QMessageBox.information(
+                self,
+                "ROI metadata saved",
+                f"Saved ROI metadata to:\n{out_path}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "ROI metadata", f"Failed to save ROI metadata:\n{e}")
+
+
+    def _cell_counter_load_roi_metadata(self):
+        st = getattr(self, "_cell_counter_state", None)
+        if not st:
+            QMessageBox.warning(self, "ROI metadata", "Cell counter state not found.")
+            return
+
+        try:
+            in_path = self._cell_counter_roi_json_path()
+            if not in_path.exists():
+                QMessageBox.information(
+                    self,
+                    "ROI metadata",
+                    f"No ROI metadata file found for this image/channel:\n{in_path}"
+                )
+                return
+
+            with open(in_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+
+            pos_layer = st["pos_shapes"]
+            neg_layer = st["neg_shapes"]
+
+            pos_z = self._cell_counter_load_shapes_from_list(
+                pos_layer,
+                payload.get("positive_rois", []),
+            )
+            neg_z = self._cell_counter_load_shapes_from_list(
+                neg_layer,
+                payload.get("negative_rois", []),
+            )
+
+            try:
+                pos_layer.edge_color = "lime"
+                pos_layer.face_color = "transparent"
+                pos_layer.visible = True
+            except Exception:
+                pass
+
+            try:
+                neg_layer.edge_color = "red"
+                neg_layer.face_color = "transparent"
+                neg_layer.visible = True
+            except Exception:
+                pass
+
+            all_z = []
+            all_z.extend(pos_z or [])
+            all_z.extend(neg_z or [])
+
+            try:
+                viewer = st.get("viewer", None)
+                vol = st.get("vol", None)
+
+                if viewer is not None and all_z:
+                    z_target = int(all_z[0])
+
+                    if vol is not None:
+                        zmax = max(0, int(np.asarray(vol).shape[0]) - 1)
+                        z_target = max(0, min(z_target, zmax))
+
+                    viewer.dims.set_point(0, z_target)
+
+                if viewer is not None:
+                    try:
+                        viewer.layers.selection.active = pos_layer if len(pos_layer.data) else neg_layer
+                    except Exception:
+                        pass
+                    try:
+                        viewer.reset_view()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            QMessageBox.information(
+                self,
+                "ROI metadata loaded",
+                f"Loaded ROI metadata from:\n{in_path}\n\n"
+                f"Positive ROIs: {len(payload.get('positive_rois', []))}\n"
+                f"Negative ROIs: {len(payload.get('negative_rois', []))}"
+            )
+
+        except Exception as e:
+            QMessageBox.critical(self, "ROI metadata", f"Failed to load ROI metadata:\n{e}")
+
     def open_cell_counter(self):
         """
         Single-image-layer Cell Counter with two detection backends:
@@ -2219,6 +2523,16 @@ class UIWidget(QWidget):
             # Manual/classic run button (renamed to clarify purpose)
             classic_btn = QPushButton("Generate/Update labels mask (Classic)")
             layout.addWidget(classic_btn)
+
+            roi_meta_row = QHBoxLayout()
+            save_roi_meta_btn = QPushButton("Save ROI metadata")
+            load_roi_meta_btn = QPushButton("Load ROI metadata")
+            roi_meta_row.addWidget(save_roi_meta_btn)
+            roi_meta_row.addWidget(load_roi_meta_btn)
+            layout.addLayout(roi_meta_row)
+
+            save_roi_meta_btn.clicked.connect(lambda _=False: self._cell_counter_save_roi_metadata())
+            load_roi_meta_btn.clicked.connect(lambda _=False: self._cell_counter_load_roi_metadata())
 
             def _run_classic():
                 self._cell_counter_set_status("Backend: classic | Generating labels...")
@@ -3907,6 +4221,7 @@ class UIWidget(QWidget):
                 return
 
             p = Path(path)
+            self.current_file_path = str(p)
             print(f"\n[load_channels] Loading: {p}")
 
             if p.suffix.lower() == ".lif":
@@ -3987,7 +4302,21 @@ class UIWidget(QWidget):
                 except Exception:
                     pass
 
-                lay = self.viewer.add_image(view2d, name=f"Channel {new_idx}", opacity=1.0)
+                channel_name = f"Channel {new_idx}"
+
+                lay = self.viewer.add_image(
+                    view2d,
+                    name=channel_name,
+                    opacity=1.0,
+                    metadata={
+                        "path": str(p),
+                        "file_path": str(p),
+                        "source_file": str(p),
+                        "filename": str(p.name),
+                        "channel_number": int(new_idx),
+                        "channel_name": channel_name,
+                    },
+                )
                 self.channel_layers.append(lay)
 
                 # Contrast limits
@@ -4372,7 +4701,7 @@ class UIWidget(QWidget):
         max_val.editingFinished.connect(lambda: self.setsliderfromlineedit(max_val, smax, 0, maxrange))
 
         # ---- Optional display tweaks (brightness + contrast multiplier) ----
-        # This mirrors your existing pattern (brightness shift, contrast multiplier). [file:375]
+
         v.addWidget(QLabel("Display (optional)"))
         disp_row = QHBoxLayout()
 
@@ -4400,7 +4729,7 @@ class UIWidget(QWidget):
         v.addLayout(disp_row)
 
         def _apply_display(_=None):
-            # derive from current min/max sliders (like your other update*display funcs) [file:375]
+            # derive from current min/max sliders 
             try:
                 base_lo = float(smin.value())
                 base_hi = float(smax.value())
