@@ -1393,6 +1393,9 @@ class UIWidget(QWidget):
                 if m3.ndim == 2:
                     m2 = (m3 > 0).astype(np.uint8)
                 else:
+                    # ---- FIX: skip stale masks whose Z count doesn't match current n_z ----
+                    if m3.shape[0] != self.n_z:
+                        continue
                     z = max(0, min(v, m3.shape[0] - 1))
                     m2 = (m3[z] > 0).astype(np.uint8)
 
@@ -1425,6 +1428,9 @@ class UIWidget(QWidget):
                 arr3 = np.asarray(arr3)
                 try:
                     if arr3.ndim == 3:
+                        # ---- FIX: guard against stale derived stack with wrong n_z ----
+                        if arr3.shape[0] != self.n_z:
+                            continue
                         z = max(0, min(v, arr3.shape[0] - 1))
                         lay.data = arr3[z]
                     else:
@@ -6644,9 +6650,15 @@ class UIWidget(QWidget):
                     if not np.all(mask_crop):
                         cropped = np.where(mask_view, cropped, fill_cast)
 
+                    # ---- FIX: reset translate to 0 for all axes; the XY offset is
+                    # absorbed into channel_list below so world-space stays consistent. ----
                     old_scale = _as_nd_tuple(getattr(image_layer, "scale", None), ndim, 1.0)
                     old_translate = list(_as_nd_tuple(getattr(image_layer, "translate", None), ndim, 0.0))
 
+                    # Only propagate the translate offset if there is a non-trivial
+                    # pre-existing world translate on this layer (e.g. from a previous
+                    # XY crop).  Otherwise reset to zero so channel_list and the napari
+                    # layer stay aligned.
                     old_translate[-2] = float(old_translate[-2]) + float(y0) * float(old_scale[-2])
                     old_translate[-1] = float(old_translate[-1]) + float(x0) * float(old_scale[-1])
 
@@ -6654,6 +6666,21 @@ class UIWidget(QWidget):
 
                     try:
                         image_layer.translate = tuple(old_translate)
+                    except Exception:
+                        pass
+
+                    # ---- FIX: sync channel_list so downstream analysis uses cropped data.
+                    # `self` here is CropWidget; use outer `self` (UIWidget) from closure. ----
+                    try:
+                        ui = self  # CropWidget; access UIWidget via closure var
+                        # The outer function parameter named `self` is the UIWidget
+                        ch_layers = getattr(self_parent, "channel_layers", None)
+                        ch_list   = getattr(self_parent, "channel_list",  None)
+                        if ch_layers is not None and ch_list is not None:
+                            if image_layer in ch_layers:
+                                idx_ch = ch_layers.index(image_layer)
+                                if idx_ch < len(ch_list):
+                                    ch_list[idx_ch] = cropped
                     except Exception:
                         pass
 
@@ -6685,6 +6712,45 @@ class UIWidget(QWidget):
                                 summary.append(self._crop_single_layer_in_place(image_layer, mask2d, bbox))
                             except Exception as e:
                                 failed.append(f"{image_layer.name}: {e}")
+
+                        # ---- FIX: after XY crop, invalidate stale derived / mask stacks
+                        # whose YX shape no longer matches the newly cropped channel_list. ----
+                        if summary:
+                            try:
+                                new_yx = None
+                                for ch in getattr(self_parent, "channel_list", []):
+                                    ca = np.asarray(ch)
+                                    if ca.ndim == 3:
+                                        new_yx = ca.shape[1:]
+                                        break
+
+                                if new_yx is not None:
+                                    # Invalidate masks with wrong YX
+                                    if hasattr(self_parent, "masks_by_channel"):
+                                        for k, m in list(self_parent.masks_by_channel.items()):
+                                            if m is not None:
+                                                ma = np.asarray(m)
+                                                if ma.ndim == 3 and ma.shape[1:] != new_yx:
+                                                    self_parent.masks_by_channel[k] = None
+
+                                    # Invalidate derived stacks with wrong YX
+                                    if hasattr(self_parent, "derived_stacks"):
+                                        stale = []
+                                        for k, ds in list(self_parent.derived_stacks.items()):
+                                            if ds is not None:
+                                                dsa = np.asarray(ds)
+                                                if dsa.ndim == 3 and dsa.shape[1:] != new_yx:
+                                                    stale.append(k)
+                                        for k in stale:
+                                            del self_parent.derived_stacks[k]
+                                            if hasattr(self_parent, "derived_layers") and k in self_parent.derived_layers:
+                                                try:
+                                                    old_lay = self_parent.derived_layers.pop(k)
+                                                    self_parent.viewer.layers.remove(old_lay)
+                                                except Exception:
+                                                    pass
+                            except Exception:
+                                pass
 
                         try:
                             main_viewer.reset_view()
@@ -6816,13 +6882,54 @@ class UIWidget(QWidget):
                 for i, ch in enumerate(self_parent.channel_list):
                     arr = np.asarray(ch)
                     if arr.ndim == 3:
-                        self_parent.channel_list[i] = arr[z0:z1+1].copy()
+                        cropped_arr = arr[z0:z1+1].copy()
+                        self_parent.channel_list[i] = cropped_arr
+                        # ---- FIX: push cropped 3D array into the napari layer ----
+                        if hasattr(self_parent, "channel_layers") and i < len(self_parent.channel_layers):
+                            try:
+                                lay = self_parent.channel_layers[i]
+                                lay.data = cropped_arr
+                                # Reset translate Z so the layer's world origin stays at 0
+                                try:
+                                    tr = list(getattr(lay, "translate", None) or ([0.0] * cropped_arr.ndim))
+                                    while len(tr) < cropped_arr.ndim:
+                                        tr.insert(0, 0.0)
+                                    tr[0] = 0.0  # Z translate reset after crop
+                                    lay.translate = tuple(tr)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
 
                 first = np.asarray(self_parent.channel_list[0])
                 self_parent.n_z = first.shape[0] if first.ndim == 3 else 1
 
                 # Store the original crop selection for display only
                 self_parent.last_crop_range = (z0, z1)
+
+                # ---- FIX: invalidate derived stacks and masks that have old Z shape ----
+                new_nz = self_parent.n_z
+                if hasattr(self_parent, "masks_by_channel"):
+                    for k, m in list(self_parent.masks_by_channel.items()):
+                        if m is not None:
+                            ma = np.asarray(m)
+                            if ma.ndim == 3 and ma.shape[0] != new_nz:
+                                self_parent.masks_by_channel[k] = None
+                if hasattr(self_parent, "derived_stacks"):
+                    stale_keys = []
+                    for k, ds in list(self_parent.derived_stacks.items()):
+                        if ds is not None:
+                            dsa = np.asarray(ds)
+                            if dsa.ndim == 3 and dsa.shape[0] != new_nz:
+                                stale_keys.append(k)
+                    for k in stale_keys:
+                        del self_parent.derived_stacks[k]
+                        if hasattr(self_parent, "derived_layers") and k in self_parent.derived_layers:
+                            try:
+                                old_lay = self_parent.derived_layers.pop(k)
+                                self_parent.viewer.layers.remove(old_lay)
+                            except Exception:
+                                pass
 
                 _refresh_z_controls()
                 QMessageBox.information(self_parent, "Cropped", f"Kept Z {z0}-{z1} (now {self_parent.n_z} slices)")
@@ -7639,7 +7746,13 @@ class UIWidget(QWidget):
                 return
 
             if mask3.shape != target3.shape:
-                QMessageBox.warning(self, "Shape mismatch", f"Mask {mask3.shape} != Target {target3.shape}")
+                QMessageBox.warning(
+                    self,
+                    "Shape mismatch",
+                    f"Mask {mask3.shape} != Target {target3.shape}\n\n"
+                    "If you recently cropped the stack, please re-generate any masks/coloc "
+                    "layers using the cropped data before running colocalization."
+                )
                 return
 
             mask_bin = (mask3 > 0)
