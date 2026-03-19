@@ -17,7 +17,7 @@ from qtpy.QtWidgets import (
 from qtpy.QtCore import Qt
 from napari.qt.threading import thread_worker
 from skimage.filters import gaussian, threshold_otsu
-from skimage.morphology import remove_small_objects, closing, disk, dilation, ball, binary_opening
+from skimage.morphology import remove_small_objects, closing, disk, dilation, ball, binary_opening, binary_closing
 from aicsimageio import AICSImage
 import tifffile
 import imageio
@@ -31,10 +31,13 @@ from scipy import ndimage as ndi
 from skimage.draw import polygon2mask
 import re
 import xml.etree.ElementTree as ET
-from skimage.morphology import disk, dilation, remove_small_objects
 from skimage.feature import peak_local_max
 from cellpose import models, train
 from cellpose import io as cellpose_io
+import traceback
+from scipy.spatial import cKDTree
+from skimage.measure import marching_cubes
+
 
 
 
@@ -161,6 +164,63 @@ def load_lif_memmap(path, scene_index=0, max_ch=4):
     return memmaps, contrast_limits, voxel_size, paths
 
 
+def _read_estimated_voxel_size(path):
+    with tifffile.TiffFile(str(path)) as tif:
+        voxel_z = None
+        voxel_y = None
+        voxel_x = None
+        unit = None
+
+        # ImageJ metadata
+        try:
+            ij = tif.imagej_metadata
+        except Exception:
+            ij = None
+
+        if ij is not None:
+            voxel_z = ij.get("spacing", None)
+            unit = ij.get("unit", None)
+
+        # TIFF tags
+        page = tif.pages[0]
+        tags = page.tags
+
+        if "XResolution" in tags:
+            try:
+                num, den = tags["XResolution"].value
+                if num != 0:
+                    voxel_x = float(den) / float(num)
+            except Exception:
+                pass
+
+        if "YResolution" in tags:
+            try:
+                num, den = tags["YResolution"].value
+                if num != 0:
+                    voxel_y = float(den) / float(num)
+            except Exception:
+                pass
+
+        if "ResolutionUnit" in tags:
+            try:
+                ru = tags["ResolutionUnit"].value
+                print("Raw ResolutionUnit:", ru)
+            except Exception:
+                ru = None
+        else:
+            ru = None
+
+        z = 1.0 if voxel_z is None else float(voxel_z)
+        y = 1.0 if voxel_y is None else float(voxel_y)
+        x = 1.0 if voxel_x is None else float(voxel_x)
+
+        print("=== Estimated voxel size ===")
+        print("Z:", z, unit)
+        print("Y:", y, unit)
+        print("X:", x, unit)
+
+        return (z, y, x)
+
 def load_tiff_memmap(path, max_ch=4):
     """Load TIFF using memory-mapped arrays via tifffile, write float32 memmaps.
     Returns (list_of_memmaps, contrast_limits_dict, voxel_size(Z,Y,X), paths).
@@ -170,148 +230,8 @@ def load_tiff_memmap(path, max_ch=4):
       3) TIFF resolution tags
     """
 
+
     print("Creating memory-mapped arrays from TIFF (memmap) using tifffile...")
-
-    # ---------- voxel size extraction helpers ----------
-    def _safe_float(x):
-        try:
-            if x is None:
-                return None
-            return float(x)
-        except Exception:
-            return None
-
-    def _parse_ome_voxel_size(tif):
-        """Return (Z,Y,X) in microns if possible, else None."""
-        ome = getattr(tif, "ome_metadata", None)
-        if not ome:
-            return None
-        try:
-            root = ET.fromstring(ome)
-            # Find first Pixels element (ignore namespaces by matching suffix)
-            pixels = None
-            for el in root.iter():
-                if el.tag.endswith("Pixels"):
-                    pixels = el
-                    break
-            if pixels is None:
-                return None
-
-            psx = _safe_float(pixels.attrib.get("PhysicalSizeX"))
-            psy = _safe_float(pixels.attrib.get("PhysicalSizeY"))
-            psz = _safe_float(pixels.attrib.get("PhysicalSizeZ"))
-
-            # Units exist too, but we assume µm if present/typical; you can extend conversion later.
-            # If any are missing, keep None.
-            if psx is None and psy is None and psz is None:
-                return None
-
-            # OME uses X,Y,Z naming; return (Z,Y,X)
-            z = 1.0 if psz is None else float(psz)
-            y = 1.0 if psy is None else float(psy)
-            x = 1.0 if psx is None else float(psx)
-            return (z, y, x)
-        except Exception:
-            return None
-
-    def _resolution_unit_to_microns(unit_code_or_str):
-        """
-        TIFF ResolutionUnit: 2=inches, 3=centimeters (common).
-        Return microns per unit.
-        """
-        try:
-            # tifffile may return an int or an enum-like
-            u = unit_code_or_str
-            if hasattr(u, "value"):
-                u = u.value
-            if isinstance(u, str):
-                s = u.lower()
-                if "inch" in s:
-                    return 25400.0
-                if "centimeter" in s or "cm" == s:
-                    return 10000.0
-                return None
-            # numeric
-            if int(u) == 2:   # inch
-                return 25400.0
-            if int(u) == 3:   # centimeter
-                return 10000.0
-            return None
-        except Exception:
-            return None
-
-    def _parse_tiff_resolution_xy(tif):
-        """Return (Y,X) microns-per-pixel from TIFF tags if present, else None."""
-        try:
-            page0 = tif.pages[0]
-            tags = page0.tags
-
-            # XResolution/YResolution are rational pixels per ResolutionUnit
-            if "XResolution" not in tags or "YResolution" not in tags or "ResolutionUnit" not in tags:
-                return None
-
-            xres = tags["XResolution"].value
-            yres = tags["YResolution"].value
-            unit = tags["ResolutionUnit"].value
-
-            # Convert rationals to float (pixels per unit)
-            xres_f = float(xres[0]) / float(xres[1]) if isinstance(xres, tuple) else float(xres)
-            yres_f = float(yres[0]) / float(yres[1]) if isinstance(yres, tuple) else float(yres)
-
-            microns_per_unit = _resolution_unit_to_microns(unit)
-            if microns_per_unit is None:
-                return None
-
-            # pixel size (units/pixel) = (microns/unit) / (pixels/unit)
-            px = microns_per_unit / xres_f if xres_f > 0 else None
-            py = microns_per_unit / yres_f if yres_f > 0 else None
-            if px is None or py is None:
-                return None
-            return (float(py), float(px))
-        except Exception:
-            return None
-
-    def _parse_imagej_voxel_size(tif):
-        """
-        ImageJ TIFF:
-          - Z spacing often in imagej_metadata['spacing'] (in units of 'unit') 
-          - XY sometimes via TIFF resolution tags; ImageJ may also embed things in ImageDescription.
-        """
-        try:
-            ij = getattr(tif, "imagej_metadata", None)
-            if not ij:
-                return None
-
-            unit = ij.get("unit", None)  # often 'um' 
-            spacing = _safe_float(ij.get("spacing", None))  # z spacing
-
-            # XY: best effort via TIFF tags
-            yx = _parse_tiff_resolution_xy(tif)
-
-            # If unit is not microns, we don't convert here (extend if you need)
-            # We'll still return values as-is; but prefer microns.
-            if yx is None and spacing is None:
-                return None
-
-            # default XY if missing
-            y = 1.0
-            x = 1.0
-            if yx is not None:
-                y, x = yx
-
-            z = 1.0 if spacing is None else float(spacing)
-            return (z, float(y), float(x))
-        except Exception:
-            return None
-
-    def _parse_generic_voxel_size(tif):
-        """Generic fallback: XY from resolution tags, Z unknown."""
-        yx = _parse_tiff_resolution_xy(tif)
-        if yx is None:
-            return None
-        y, x = yx
-        return (1.0, float(y), float(x))
-
     # ---------- read pixels (prefer memmap) ----------
     try:
         data = tifffile.memmap(str(path))
@@ -332,20 +252,9 @@ def load_tiff_memmap(path, max_ch=4):
                 c_total = arr.shape[0] if arr.ndim == 4 else 1
             return load_lif_memmap(path, scene_index=0, max_ch=min(max_ch, max(1, c_total)))
 
-    # ---------- extract voxel size ----------
-    voxel_size = (1.0, 1.0, 1.0)
-    try:
-        with tifffile.TiffFile(str(path)) as tif:
-            vs = _parse_ome_voxel_size(tif)
-            if vs is None:
-                vs = _parse_imagej_voxel_size(tif)
-            if vs is None:
-                vs = _parse_generic_voxel_size(tif)
-            if vs is not None:
-                voxel_size = tuple(map(float, vs))
-    except Exception:
-        pass
 
+    # ---------- extract voxel size ----------
+    voxel_size = _read_estimated_voxel_size(path)
     # ---------- normalize array into (C, Z, Y, X) ----------
     arr = np.asarray(arr)
     if arr.ndim == 4:
@@ -363,14 +272,18 @@ def load_tiff_memmap(path, max_ch=4):
     else:
         arr_czyx = np.reshape(arr, (1, 1) + arr.shape[-2:])
 
+
     c_total = arr_czyx.shape[0]
     n_ch = min(max_ch, max(1, c_total))
+
 
     # ---------- write float32 memmaps ----------
     temp_dir = Path.cwd() / "napari_mmap_files"
     temp_dir.mkdir(parents=True, exist_ok=True)
 
+
     n_z, y, x = arr_czyx.shape[1], arr_czyx.shape[2], arr_czyx.shape[3]
+
 
     memmaps = []
     paths = []
@@ -379,6 +292,7 @@ def load_tiff_memmap(path, max_ch=4):
         mm = np.memmap(p, dtype=np.float32, mode='w+', shape=(n_z, y, x))
         memmaps.append(mm)
         paths.append(p)
+
 
     print("Writing data to memory-mapped files (this may take a few minutes)...")
     chunk_size = 30
@@ -390,6 +304,7 @@ def load_tiff_memmap(path, max_ch=4):
             memmaps[ch_i][start_z:end_z] = chunk
             memmaps[ch_i].flush()
 
+
         elapsed = time.time() - start_time
         chunks_done = idx + 1
         total_chunks = (n_z + chunk_size - 1) // chunk_size
@@ -397,6 +312,7 @@ def load_tiff_memmap(path, max_ch=4):
         time_per_chunk = elapsed / chunks_done
         est_remaining = remaining_chunks * time_per_chunk
         print(f"  Processed slices {start_z}-{end_z-1} of {n_z-1} ({elapsed:.1f}s elapsed, ~{est_remaining:.1f}s remaining)")
+
 
     # ---------- contrast limits ----------
     contrast_limits = {}
@@ -409,10 +325,10 @@ def load_tiff_memmap(path, max_ch=4):
             lo, hi = 0, 65535
         contrast_limits[f'ch{i}'] = (float(lo), float(hi))
 
+
     print(f"Voxel size (Z, Y, X): {voxel_size}")
     print("Memory-mapped TIFF files created successfully!")
     return memmaps, contrast_limits, voxel_size, paths
-
 
 ###############################################################################
 # ----------------------------- MASK COMPUTATION-----------------------------
@@ -499,6 +415,10 @@ class AnalysisPopupDialog(QDialog):
         self.cellcount_btn.clicked.connect(lambda _=False: self.parent_widget.open_cell_counter())
         layout.addWidget(self.cellcount_btn)
 
+        self.punctacount_btn = QPushButton("Puncta Counter (Count puncta in with Mask ROI)")
+        self.punctacount_btn.clicked.connect(lambda _=False: self.parent_widget.open_puncta_counter())
+        layout.addWidget(self.punctacount_btn)
+
         layout.addStretch()
         self.setLayout(layout)
 
@@ -511,7 +431,13 @@ class MaskTunerDialog(QDialog):
     - Embedded napari viewer (2D slice view driven by this dialog's Z slider)
     - Right-side per-layer controls for channel + mask (visible/opacity/color/contrast)
     - Save/Load metadata that includes ALL widget + layer control settings
+
+    Updated behavior:
+    - Always refreshes source data from the parent widget's CURRENT channel layer/data.
+    - Picks up cropped/replaced channel stacks from the main viewer.
+    - Keeps dialog Z synchronized with the parent viewer's Z when possible.
     """
+
     def __init__(self, parent_widget, channel_index, channel_data, file_path=None):
         super().__init__(parent_widget)
 
@@ -522,11 +448,16 @@ class MaskTunerDialog(QDialog):
             getattr(parent_widget, "file_path", "unknown")
         )
 
-        self.arr = np.asarray(channel_data)
+        self._syncing_parent_z = False
+        self._syncing_local_z = False
+
+        # Pull CURRENT source data from parent if available; fall back to provided data
+        src = self._get_current_source_array(fallback=channel_data)
+        self.arr = np.asarray(src)
         self.arr3 = self.arr[np.newaxis, ...] if self.arr.ndim == 2 else self.arr
         self.nz = int(self.arr3.shape[0]) if self.arr3.ndim == 3 else 1
 
-        self.z = int(getattr(parent_widget, "current_z", 0))
+        self.z = self._get_parent_current_z()
         self.z = max(0, min(self.z, max(self.nz - 1, 0)))
 
         # thresholding state (drives mask computation)
@@ -572,12 +503,12 @@ class MaskTunerDialog(QDialog):
             contrast_limits=(0, 1),
         )
 
-        # Right: controls panel (we will store handles to all widgets)
+        # Right: controls panel
         right = QWidget()
         right_lay = QVBoxLayout(right)
         right_lay.setContentsMargins(6, 6, 6, 6)
 
-        self.layer_ctrl_widgets = {}  # keys: "channel", "mask" -> dict of widgets
+        self.layer_ctrl_widgets = {}
 
         gb1, ctrl1 = self._layer_controls_group(
             title=f"Channel {self.channel_index + 1} Controls",
@@ -617,9 +548,8 @@ class MaskTunerDialog(QDialog):
 
         ctrl.addWidget(QLabel("Threshold"))
         self.th_slider = QSlider(Qt.Horizontal)
-        th_max = int(np.max(self.arr3)) if self.arr3.size else 1
-        self.th_slider.setRange(0, max(th_max, 1))
-        self.th_slider.setValue(int(self.threshold))
+        self._update_threshold_slider_range()
+        self.th_slider.setValue(int(max(0, min(self.threshold, self.th_slider.maximum()))))
         ctrl.addWidget(self.th_slider)
 
         self.th_val = QLabel(str(int(self.threshold)))
@@ -669,8 +599,180 @@ class MaskTunerDialog(QDialog):
         self.save_meta_btn.clicked.connect(self._save_channel_meta)
         self.load_meta_btn.clicked.connect(self._load_channel_meta)
 
-        # ---- initialize preview ----
+        # Sync with parent viewer Z if available
+        try:
+            if hasattr(self.parent_widget, "viewer") and hasattr(self.parent_widget.viewer, "dims"):
+                self.parent_widget.viewer.dims.events.current_step.connect(self._on_parent_dims_changed)
+        except Exception:
+            pass
+
+        # ---- initialize preview from latest parent data ----
+        self._refresh_source_from_parent()
         self._preview_current_slice()
+
+    # ---------------- parent/source sync ----------------
+    def _get_parent_current_z(self):
+        try:
+            if hasattr(self.parent_widget, "current_z"):
+                return int(getattr(self.parent_widget, "current_z", 0))
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self.parent_widget, "viewer") and hasattr(self.parent_widget.viewer, "dims"):
+                return int(self.parent_widget.viewer.dims.current_step[0])
+        except Exception:
+            pass
+
+        return 0
+
+    def _get_current_source_array(self, fallback=None):
+        candidates = []
+
+        # Prefer current data from the parent's live napari layer
+        try:
+            layers = getattr(self.parent_widget, "channel_layers", None)
+            if layers is not None and self.channel_index < len(layers):
+                lyr = layers[self.channel_index]
+                arr = np.asarray(lyr.data)
+                if arr.size > 0:
+                    candidates.append(arr)
+        except Exception:
+            pass
+
+        # Fall back to parent widget's channel list storage
+        try:
+            ch_list = getattr(self.parent_widget, "channel_list", None)
+            if ch_list is not None and self.channel_index < len(ch_list):
+                arr = np.asarray(ch_list[self.channel_index])
+                if arr.size > 0:
+                    candidates.append(arr)
+        except Exception:
+            pass
+
+        # Finally use constructor data
+        try:
+            if fallback is not None:
+                arr = np.asarray(fallback)
+                if arr.size > 0:
+                    candidates.append(arr)
+        except Exception:
+            pass
+
+        if not candidates:
+            return np.zeros((1, 1), dtype=np.float32)
+
+        # Prefer a 3D stack if one exists, otherwise first valid candidate
+        for arr in candidates:
+            if arr.ndim >= 3:
+                return arr
+        return candidates[0]
+
+    def _update_threshold_slider_range(self):
+        try:
+            th_max = int(np.nanmax(self.arr3)) if self.arr3.size else 1
+        except Exception:
+            th_max = 1
+        th_max = max(int(th_max), 1)
+
+        if hasattr(self, "th_slider") and self.th_slider is not None:
+            cur = int(getattr(self, "threshold", 0))
+            self.th_slider.blockSignals(True)
+            self.th_slider.setRange(0, th_max)
+            self.th_slider.setValue(max(0, min(cur, th_max)))
+            self.th_slider.blockSignals(False)
+
+        self.threshold = max(0, min(int(getattr(self, "threshold", 0)), th_max))
+        if hasattr(self, "th_val") and self.th_val is not None:
+            self.th_val.setText(str(int(self.threshold)))
+
+    def _refresh_source_from_parent(self):
+        old_shape = tuple(self.arr3.shape) if hasattr(self, "arr3") else None
+
+        src = self._get_current_source_array(fallback=getattr(self, "arr3", None))
+        self.arr = np.asarray(src)
+        self.arr3 = self.arr[np.newaxis, ...] if self.arr.ndim == 2 else self.arr
+
+        if self.arr3.ndim != 3:
+            self.arr3 = np.asarray(self.arr3).reshape((1,) + tuple(np.asarray(self.arr3).shape[-2:]))
+
+        self.nz = int(self.arr3.shape[0]) if self.arr3.ndim == 3 else 1
+
+        parent_z = self._get_parent_current_z()
+        self.z = max(0, min(int(parent_z), max(self.nz - 1, 0)))
+
+        new_shape = tuple(self.arr3.shape)
+
+        # If cropping changed shape, reset preview masks to match new data
+        if not hasattr(self, "preview_masks") or old_shape != new_shape:
+            self.preview_masks = np.zeros(new_shape, dtype=np.uint8)
+
+        # Keep dialog widgets aligned with current source
+        if hasattr(self, "z_slider") and self.z_slider is not None:
+            self.z_slider.blockSignals(True)
+            self.z_slider.setRange(0, max(self.nz - 1, 0))
+            self.z_slider.setValue(self.z)
+            self.z_slider.blockSignals(False)
+
+        if hasattr(self, "z_label") and self.z_label is not None:
+            self.z_label.setText(f"{self.z}/{max(self.nz - 1, 0)}")
+
+        self._update_threshold_slider_range()
+
+        # Refresh displayed image slice
+        if hasattr(self, "img_layer") and self.img_layer is not None:
+            try:
+                self.img_layer.data = self.arr3[self.z]
+            except Exception:
+                pass
+
+        if hasattr(self, "mask_layer") and self.mask_layer is not None:
+            try:
+                self.mask_layer.data = self.preview_masks[self.z]
+                self.mask_layer.contrast_limits = (0, 1)
+            except Exception:
+                pass
+
+        try:
+            self.viewer.reset_view()
+        except Exception:
+            pass
+
+    def _push_z_to_parent(self, z):
+        try:
+            if hasattr(self.parent_widget, "z_changed"):
+                self.parent_widget.z_changed(int(z))
+                return
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self.parent_widget, "viewer") and hasattr(self.parent_widget.viewer, "dims"):
+                self.parent_widget.viewer.dims.set_current_step(0, int(z))
+        except Exception:
+            pass
+
+    def _on_parent_dims_changed(self, event=None):
+        if self._syncing_parent_z:
+            return
+
+        self._syncing_parent_z = True
+        try:
+            self._refresh_source_from_parent()
+
+            z = self._get_parent_current_z()
+            z = max(0, min(int(z), max(self.nz - 1, 0)))
+            self.z = z
+
+            self.z_slider.blockSignals(True)
+            self.z_slider.setRange(0, max(self.nz - 1, 0))
+            self.z_slider.setValue(self.z)
+            self.z_slider.blockSignals(False)
+
+            self.z_label.setText(f"{self.z}/{max(self.nz - 1, 0)}")
+            self._preview_current_slice()
+        finally:
+            self._syncing_parent_z = False
 
     # ---------------- helpers ----------------
     def _set_slider_from_lineedit(self, lineedit, slider, lo, hi):
@@ -687,7 +789,6 @@ class MaskTunerDialog(QDialog):
             cm = getattr(layer, "colormap", None)
             if cm is None:
                 return None
-            # napari colormap objects have .name; hex strings also fine
             name = getattr(cm, "name", None)
             if isinstance(name, str) and name:
                 return name
@@ -725,44 +826,51 @@ class MaskTunerDialog(QDialog):
 
     # ---------------- UI handlers ----------------
     def _on_z_changed(self, v):
-        self.z = int(v)
-
-        # If nz is invalid, do nothing
-        nz = int(getattr(self, "nz", 0) or 0)
-        if nz <= 0:
+        if self._syncing_local_z:
             return
 
-        self.z = max(0, min(self.z, nz - 1))
-        self.z_label.setText(f"{self.z}/{max(nz - 1, 0)}")
+        self._syncing_local_z = True
+        try:
+            self._refresh_source_from_parent()
 
-        # Only slice if the backing stacks are actually 3D
-        if hasattr(self, "arr3"):
-            a = np.asarray(self.arr3)
-            if a.ndim == 3 and a.shape[0] == nz:
-                self.img_layer.data = a[self.z]
+            self.z = int(v)
+            nz = int(getattr(self, "nz", 0) or 0)
+            if nz <= 0:
+                return
 
-        if hasattr(self, "preview_masks"):
-            m = np.asarray(self.preview_masks)
-            if m.ndim == 3 and m.shape[0] == nz:
-                self.mask_layer.data = m[self.z]
-                try:
-                    self.mask_layer.contrast_limits = (0, 1)
-                except Exception:
-                    pass
+            self.z = max(0, min(self.z, nz - 1))
+            self.z_label.setText(f"{self.z}/{max(nz - 1, 0)}")
 
-        # Update dynamically loaded channels
-        if hasattr(self, "channel_full_stacks") and hasattr(self, "channel_layers"):
-            for stack, lay in zip(self.channel_full_stacks, self.channel_layers):
-                a = np.asarray(stack)
-                if a.ndim == 3:
-                    z = max(0, min(self.z, a.shape[0] - 1))
-                    lay.data = a[z]
-                else:
-                    lay.data = a
+            # Update local 2D display
+            self.img_layer.data = self.arr3[self.z]
 
-        self._preview_current_slice()
+            if hasattr(self, "preview_masks"):
+                m = np.asarray(self.preview_masks)
+                if m.ndim == 3 and m.shape[0] == nz:
+                    self.mask_layer.data = m[self.z]
+                    try:
+                        self.mask_layer.contrast_limits = (0, 1)
+                    except Exception:
+                        pass
 
+            # Sync main UI / parent viewer z
+            if not self._syncing_parent_z:
+                self._push_z_to_parent(self.z)
 
+            # Optional dynamically loaded channels
+            if hasattr(self, "channel_full_stacks") and hasattr(self, "channel_layers"):
+                for stack, lay in zip(self.channel_full_stacks, self.channel_layers):
+                    a = np.asarray(stack)
+                    if a.ndim == 3:
+                        z = max(0, min(self.z, a.shape[0] - 1))
+                        lay.data = a[z]
+                    else:
+                        lay.data = a
+
+            self._preview_current_slice()
+
+        finally:
+            self._syncing_local_z = False
 
     def _dtype_max_value(self, dtype):
         dt = np.dtype(dtype)
@@ -773,21 +881,25 @@ class MaskTunerDialog(QDialog):
         return 65535
 
     def _on_threshold_changed(self, v):
+        self._refresh_source_from_parent()
         self.threshold = int(v)
         self.th_val.setText(str(int(self.threshold)))
         self._preview_current_slice()
 
     def _on_blur_toggle(self, s):
+        self._refresh_source_from_parent()
         self.blur_enabled = bool(s)
         self._preview_current_slice()
 
     def _on_sigma_changed(self, v):
+        self._refresh_source_from_parent()
         self.blur_sigma = float(v) / 10.0
         self.sigma_val.setText(f"{self.blur_sigma:.1f}")
         if self.blur_enabled:
             self._preview_current_slice()
 
     def _otsu_current_slice(self):
+        self._refresh_source_from_parent()
         sl = self.arr3[self.z]
         try:
             th = float(threshold_otsu(sl))
@@ -797,7 +909,7 @@ class MaskTunerDialog(QDialog):
 
         self.th_slider.blockSignals(True)
         try:
-            self.th_slider.setValue(self.threshold)
+            self.th_slider.setValue(max(0, min(self.threshold, self.th_slider.maximum())))
         finally:
             self.th_slider.blockSignals(False)
 
@@ -806,6 +918,8 @@ class MaskTunerDialog(QDialog):
 
     # ---------------- mask preview ----------------
     def _preview_current_slice(self):
+        self._refresh_source_from_parent()
+
         m = compute_mask(
             self.arr3[self.z],
             threshold=self.threshold,
@@ -816,6 +930,11 @@ class MaskTunerDialog(QDialog):
         )
         self.preview_masks[self.z] = m
 
+        try:
+            self.img_layer.data = self.arr3[self.z]
+        except Exception:
+            pass
+
         self.mask_layer.data = self.preview_masks[self.z]
         try:
             self.mask_layer.contrast_limits = (0, 1)
@@ -823,6 +942,8 @@ class MaskTunerDialog(QDialog):
             pass
 
     def _preview_full_stack(self):
+        self._refresh_source_from_parent()
+
         for z in range(self.nz):
             self.preview_masks[z] = compute_mask(
                 self.arr3[z],
@@ -832,11 +953,19 @@ class MaskTunerDialog(QDialog):
                 min_size=0,
                 do_close=False,
             )
+
+        self.img_layer.data = self.arr3[self.z]
         self.mask_layer.data = self.preview_masks[self.z]
+        try:
+            self.mask_layer.contrast_limits = (0, 1)
+        except Exception:
+            pass
 
     # ---------------- accept into main ----------------
     def _accept_mask(self):
         try:
+            self._refresh_source_from_parent()
+
             # Always build a complete 3D mask using the *current* parameters
             self._preview_full_stack()
 
@@ -844,7 +973,7 @@ class MaskTunerDialog(QDialog):
 
             self.parent_widget.create_mask_layer(self.channel_index, masks_out)
             try:
-                self.parent_widget.z_changed(int(getattr(self.parent_widget, "current_z", 0)))
+                self.parent_widget.z_changed(int(getattr(self.parent_widget, "current_z", self.z)))
             except Exception:
                 pass
 
@@ -862,20 +991,15 @@ class MaskTunerDialog(QDialog):
         return meta_dir / f"{stem}.channel{self.channel_index + 1}.maskmeta.json"
 
     def _collect_ui_state(self):
-        """Collect ALL UI widget values + relevant layer settings."""
         md = {
             "type": "mask_tuner_channel_meta_v2",
             "source_file": str(self.file_path),
             "timestamp": datetime.now().isoformat(),
             "channel_index_0based": int(self.channel_index),
-
-            # thresholding controls
             "z": int(self.z_slider.value()),
             "threshold": int(self.th_slider.value()),
             "blur_enabled": bool(self.blur_cb.isChecked()),
             "blur_sigma": float(self.sigma_slider.value()) / 10.0,
-
-            # layer settings and right-panel widget states
             "layers": {
                 "channel": {
                     "visible": bool(getattr(self.img_layer, "visible", True)),
@@ -899,7 +1023,6 @@ class MaskTunerDialog(QDialog):
         try:
             path = self._meta_path_default()
 
-            # Update stored per-layer UI values right before save
             for key in ("channel", "mask"):
                 ctrl = self.layer_ctrl_widgets.get(key, {})
                 if not ctrl:
@@ -921,6 +1044,8 @@ class MaskTunerDialog(QDialog):
 
     def _load_channel_meta(self):
         try:
+            self._refresh_source_from_parent()
+
             path = self._meta_path_default()
             if not path.exists():
                 QMessageBox.warning(self, "Not found", f"No meta file found:\n{path}")
@@ -929,7 +1054,6 @@ class MaskTunerDialog(QDialog):
             with open(path, "r") as f:
                 md = json.load(f)
 
-            # ---- apply thresholding sliders ----
             self.z_slider.blockSignals(True)
             self.th_slider.blockSignals(True)
             self.blur_cb.blockSignals(True)
@@ -942,7 +1066,7 @@ class MaskTunerDialog(QDialog):
                 bs = float(md.get("blur_sigma", self.blur_sigma))
 
                 self.z_slider.setValue(z)
-                self.th_slider.setValue(th)
+                self.th_slider.setValue(max(0, min(th, self.th_slider.maximum())))
                 self.blur_cb.setChecked(be)
                 self.sigma_slider.setValue(int(round(bs * 10)))
             finally:
@@ -951,7 +1075,6 @@ class MaskTunerDialog(QDialog):
                 self.blur_cb.blockSignals(False)
                 self.sigma_slider.blockSignals(False)
 
-            # update internal state + labels
             self.z = int(self.z_slider.value())
             self.threshold = int(self.th_slider.value())
             self.blur_enabled = bool(self.blur_cb.isChecked())
@@ -960,12 +1083,10 @@ class MaskTunerDialog(QDialog):
             self.th_val.setText(str(int(self.threshold)))
             self.sigma_val.setText(f"{self.blur_sigma:.1f}")
 
-            # ---- apply layer settings (visible/opacity/contrast/colormap) ----
             layers_md = md.get("layers", {})
             self._apply_layer_settings(self.img_layer, layers_md.get("channel", {}))
             self._apply_layer_settings(self.mask_layer, layers_md.get("mask", {}))
 
-            # ---- apply right-panel UI sliders to match ----
             def _apply_ctrl(key):
                 ctrl = self.layer_ctrl_widgets.get(key, {})
                 ui = (layers_md.get(key, {}) or {}).get("ui", {}) or (layers_md.get(key, {}) or {}).get("ui_state", {})
@@ -994,7 +1115,6 @@ class MaskTunerDialog(QDialog):
                     finally:
                         widget.blockSignals(False)
 
-                # trigger layer update from sliders
                 try:
                     ctrl["apply_fn"]()
                 except Exception:
@@ -1003,7 +1123,7 @@ class MaskTunerDialog(QDialog):
             _apply_ctrl("channel")
             _apply_ctrl("mask")
 
-            # update displayed slices + recompute mask
+            self._refresh_source_from_parent()
             self.img_layer.data = self.arr3[self.z]
             self.mask_layer.data = self.preview_masks[self.z]
             self._preview_current_slice()
@@ -1021,7 +1141,6 @@ class MaskTunerDialog(QDialog):
         gb = QGroupBox(title)
         vlay = QVBoxLayout(gb)
 
-        # Visible + opacity + color
         top = QHBoxLayout()
         vis_cb = QCheckBox("Visible")
         vis_cb.setChecked(True)
@@ -1037,7 +1156,6 @@ class MaskTunerDialog(QDialog):
         top.addWidget(color_btn)
         vlay.addLayout(top)
 
-        # Contrast limits sliders
         if is_mask:
             lo, hi = 0, 1
             default_min, default_max = 0, 1
@@ -1074,7 +1192,6 @@ class MaskTunerDialog(QDialog):
         min_slider = _minmax_row("Min:", default_min)
         max_slider = _minmax_row("Max:", default_max)
 
-        # Apply function: write UI -> layer
         def apply_fn():
             try:
                 layer.visible = bool(vis_cb.isChecked())
@@ -1093,13 +1210,11 @@ class MaskTunerDialog(QDialog):
             except Exception:
                 pass
             if is_mask:
-                # keep mask visible even if user moves contrast around
                 try:
                     layer.contrast_limits = (0, 1)
                 except Exception:
                     pass
 
-        # Connect signals
         vis_cb.stateChanged.connect(lambda _=None: apply_fn())
         opacity_slider.valueChanged.connect(lambda _=None: apply_fn())
         min_slider.valueChanged.connect(lambda _=None: apply_fn())
@@ -1113,9 +1228,9 @@ class MaskTunerDialog(QDialog):
                 layer.colormap = col.name()
             except Exception:
                 pass
+
         color_btn.clicked.connect(pick_color)
 
-        # initialize
         apply_fn()
 
         ctrl = {
@@ -1124,9 +1239,17 @@ class MaskTunerDialog(QDialog):
             "min_slider": min_slider,
             "max_slider": max_slider,
             "apply_fn": apply_fn,
-            "ui_state": {},   # filled on save
+            "ui_state": {},
         }
         return gb, ctrl
+
+    def closeEvent(self, event):
+        try:
+            if hasattr(self.parent_widget, "viewer") and hasattr(self.parent_widget.viewer, "dims"):
+                self.parent_widget.viewer.dims.events.current_step.disconnect(self._on_parent_dims_changed)
+        except Exception:
+            pass
+        super().closeEvent(event)
 
 ###############################################################################
 
@@ -1144,23 +1267,197 @@ class UIWidget(QWidget):
         first = np.asarray(channel_list[0])
         self.n_z = first.shape[0] if first.ndim == 3 else 1
         self.current_z = 0
+        self._syncing_z = False
 
         self.setLayout(QVBoxLayout())
         self.build_ui()
         self.setAttribute(Qt.WA_DeleteOnClose, True)
+
         self.coloc_controls = getattr(self, "coloc_controls", [])
         self.coloc_control_boxes = getattr(self, "coloc_control_boxes", [])
+        self.layer_control_widgets = getattr(self, "layer_control_widgets", {})
+        self.mask_layers = getattr(self, "mask_layers", {})
+        self.derived_layers = getattr(self, "derived_layers", {})
+        self.masks_by_channel = getattr(self, "masks_by_channel", {})
+        self.derived_stacks = getattr(self, "derived_stacks", {})
+
         arr = np.asarray(channel_list[0])
         print("dtype:", arr.dtype, "shape:", arr.shape, "min/max:", float(np.min(arr)), float(np.max(arr)))
+
+        # Sync custom slider from napari dims
+        try:
+            self.viewer.dims.events.current_step.connect(self._sync_from_napari_dims)
+        except Exception:
+            pass
+
+        # Initialize napari dims to a valid z if possible
+        try:
+            self._set_napari_z(self.current_z)
+        except Exception:
+            pass
+
+        # Initialize slider from napari state
+        try:
+            self._sync_from_napari_dims()
+        except Exception:
+            pass
+
+    def _get_z_axis(self):
+        try:
+            first = np.asarray(self.channel_list[0])
+            if first.ndim >= 3:
+                return 0
+        except Exception:
+            pass
+        return 0
+
+    def _set_napari_z(self, z):
+        z = int(max(0, min(self.n_z - 1, int(z))))
+        z_axis = self._get_z_axis()
+
+        try:
+            self.viewer.dims.set_current_step(z_axis, z)
+        except Exception:
+            try:
+                steps = list(self.viewer.dims.current_step)
+                if z_axis < len(steps):
+                    steps[z_axis] = z
+                    self.viewer.dims.current_step = tuple(steps)
+            except Exception:
+                pass
+
+    def _sync_from_napari_dims(self, event=None):
+        if self._syncing_z:
+            return
+
+        self._syncing_z = True
+        try:
+            z_axis = self._get_z_axis()
+
+            try:
+                z = int(self.viewer.dims.current_step[z_axis])
+            except Exception:
+                z = self.current_z
+
+            z = int(max(0, min(self.n_z - 1, z)))
+            self.current_z = z
+
+            if hasattr(self, "z_slider") and self.z_slider is not None:
+                self.z_slider.blockSignals(True)
+                self.z_slider.setRange(0, max(self.n_z - 1, 0))
+                self.z_slider.setValue(z)
+                self.z_slider.blockSignals(False)
+
+            self._update_aux_layers_for_z(z)
+
+        finally:
+            self._syncing_z = False
+
+    def z_changed(self, v):
+        """
+        Keep this function name unchanged because other code may call it.
+        Now it drives napari's dims Z position instead of replacing 3D layer data.
+        """
+        if self._syncing_z:
+            return
+
+        self._syncing_z = True
+        try:
+            v = int(max(0, min(self.n_z - 1, int(v))))
+            self.current_z = v
+
+            # Update napari's actual Z dimension
+            self._set_napari_z(v)
+
+            # Keep any UI-managed 2D auxiliary layers in sync
+            self._update_aux_layers_for_z(v)
+
+        finally:
+            self._syncing_z = False
+
+    def _update_aux_layers_for_z(self, v):
+        v = int(v)
+
+        # ---------------------------------------------------------
+        # DO NOT reslice the main channel image layers here.
+        # Leave them as full 3D stacks so napari controls Z.
+        # ---------------------------------------------------------
+
+        # ---- masks ----
+        if hasattr(self, "masks_by_channel"):
+            for ch_idx, m3 in list(self.masks_by_channel.items()):
+                if m3 is None:
+                    continue
+
+                m3 = np.asarray(m3)
+                if m3.ndim == 2:
+                    m2 = (m3 > 0).astype(np.uint8)
+                else:
+                    z = max(0, min(v, m3.shape[0] - 1))
+                    m2 = (m3[z] > 0).astype(np.uint8)
+
+                lay = None
+                if hasattr(self, "mask_layers"):
+                    lay = self.mask_layers.get(ch_idx, None)
+
+                if lay is None:
+                    name = f"Channel {ch_idx+1} mask"
+                    try:
+                        lay = self.viewer.layers[name]
+                    except Exception:
+                        lay = None
+
+                if lay is not None:
+                    try:
+                        lay.data = m2
+                        lay.contrast_limits = (0, 1)
+                    except Exception:
+                        pass
+
+        # ---- derived (coloc/multiply) ----
+        if hasattr(self, "derived_stacks"):
+            self.derived_layers = getattr(self, "derived_layers", {})
+            for k, arr3 in list(self.derived_stacks.items()):
+                lay = self.derived_layers.get(k, None)
+                if lay is None:
+                    continue
+
+                arr3 = np.asarray(arr3)
+                try:
+                    if arr3.ndim == 3:
+                        z = max(0, min(v, arr3.shape[0] - 1))
+                        lay.data = arr3[z]
+                    else:
+                        lay.data = arr3
+                except Exception:
+                    pass
+
+        # prune deleted coloc controls
+        if hasattr(self, "coloc_controls"):
+            alive = []
+            alive_boxes = []
+            for ctrl, box in zip(self.coloc_controls, getattr(self, "coloc_control_boxes", [])):
+                lay = ctrl.get("layer", None)
+                if lay is not None and lay in self.viewer.layers:
+                    alive.append(ctrl)
+                    alive_boxes.append(box)
+                else:
+                    try:
+                        box.setParent(None)
+                    except Exception:
+                        pass
+            self.coloc_controls = alive
+            self.coloc_control_boxes = alive_boxes
 
     def build_ui(self):
         layout = self.layout()
 
         # Z slider
-        z_box = QGroupBox('Z Slice Navigation')
+        z_box = QGroupBox("Z Slice Navigation")
         z_layout = QVBoxLayout()
         self.z_slider = QSlider(Qt.Horizontal)
         self.z_slider.setRange(0, max(self.n_z - 1, 0))
+        self.z_slider.setValue(self.current_z)
         self.z_slider.valueChanged.connect(self.z_changed)
         z_layout.addWidget(self.z_slider)
         z_box.setLayout(z_layout)
@@ -1177,7 +1474,6 @@ class UIWidget(QWidget):
                     if best_dtype is None:
                         best_dtype = arr.dtype
 
-                    # sample a few z planes
                     if arr.ndim == 3 and arr.shape[0] > 1:
                         z_idx = [0, arr.shape[0] // 2, arr.shape[0] - 1]
                         sample = np.asarray(arr[z_idx, ...]).ravel()
@@ -1193,18 +1489,19 @@ class UIWidget(QWidget):
                     best_max = max(best_max, float(np.max(sample)))
                     best_p99 = max(best_p99, float(np.percentile(sample, 99)))
 
-                # integer range
                 if best_dtype is not None and np.issubdtype(best_dtype, np.integer):
                     return int(min(np.iinfo(best_dtype).max, fallback))
 
-                # float range
                 v = best_p99 if best_p99 > 0 else best_max
                 if v <= 0:
                     return fallback
 
-                if v <= 255: return 255
-                if v <= 4095: return 4095
-                if v <= 65535: return 65535
+                if v <= 255:
+                    return 255
+                if v <= 4095:
+                    return 4095
+                if v <= 65535:
+                    return 65535
                 return int(min(v, fallback))
 
             except Exception:
@@ -1214,25 +1511,26 @@ class UIWidget(QWidget):
 
         # Per-channel controls
         for idx, layer in enumerate(self.channel_layers, start=1):
-            gb = QGroupBox(f'Channel {idx} Controls')
+            gb = QGroupBox(f"Channel {idx} Controls")
             vlay = QVBoxLayout()
 
             # Visibility + opacity
             top_h = QHBoxLayout()
-            vis_cb = QCheckBox('Visible')
+            vis_cb = QCheckBox("Visible")
             vis_cb.setChecked(True)
-            vis_cb.stateChanged.connect(lambda s, lyr=layer: setattr(lyr, 'visible', bool(s)))
+            vis_cb.stateChanged.connect(lambda s, lyr=layer: setattr(lyr, "visible", bool(s)))
             top_h.addWidget(vis_cb)
 
-            top_h.addWidget(QLabel('Opacity'))
+            top_h.addWidget(QLabel("Opacity"))
             op = QSlider(Qt.Horizontal)
             op.setRange(0, 100)
             op.setValue(int(layer.opacity * 100))
-            op.valueChanged.connect(lambda v, lyr=layer: setattr(lyr, 'opacity', v / 100.0))
+            op.valueChanged.connect(lambda v, lyr=layer: setattr(lyr, "opacity", v / 100.0))
             top_h.addWidget(op)
 
             # Color picker
-            color_btn = QPushButton('Color')
+            color_btn = QPushButton("Color")
+
             def make_color_picker(lyr):
                 def pick():
                     col = QColorDialog.getColor(parent=self)
@@ -1242,23 +1540,22 @@ class UIWidget(QWidget):
                         except Exception:
                             pass
                 return pick
+
             color_btn.clicked.connect(make_color_picker(layer))
             top_h.addWidget(color_btn)
-
             vlay.addLayout(top_h)
 
-            # ---------------------------------------------------
-            # MIN / MAX CONTRAST SLIDERS (kept)
-            # ---------------------------------------------------
+            # Min slider
             ch_min_layout = QHBoxLayout()
-            ch_min_layout.addWidget(QLabel('Min:'))
+            ch_min_layout.addWidget(QLabel("Min:"))
             ch_min = QSlider(Qt.Horizontal)
             ch_min.setRange(0, max_range)
 
             try:
-                lim = self.contrast_limits.get(f'ch{idx}', None)
+                lim = self.contrast_limits.get(f"ch{idx}", None)
             except Exception:
                 lim = None
+
             if lim is None:
                 try:
                     lim = tuple(layer.contrast_limits)
@@ -1277,8 +1574,9 @@ class UIWidget(QWidget):
             ch_min_layout.addWidget(ch_min_val)
             vlay.addLayout(ch_min_layout)
 
+            # Max slider
             ch_max_layout = QHBoxLayout()
-            ch_max_layout.addWidget(QLabel('Max:'))
+            ch_max_layout.addWidget(QLabel("Max:"))
             ch_max = QSlider(Qt.Horizontal)
             ch_max.setRange(0, max_range)
             ch_max.setValue(int(lim[1]))
@@ -1293,8 +1591,7 @@ class UIWidget(QWidget):
             ch_max_layout.addWidget(ch_max_val)
             vlay.addLayout(ch_max_layout)
 
-            # Apply min/max updates to napari
-            def _apply_contrast(_=None, lyr=layer, smin=ch_min, smax=ch_max, le_min=ch_min_val, le_max=ch_max_val):
+            def _apply_contrast(_=None, lyr=layer, smin=ch_min, smax=ch_max, le_min=ch_min_val, le_max=ch_max_val, i=idx):
                 lo = int(smin.value())
                 hi = int(smax.value())
                 if hi < lo:
@@ -1311,10 +1608,14 @@ class UIWidget(QWidget):
                 except Exception:
                     pass
 
+                try:
+                    self.contrast_limits[f"ch{i}"] = (lo, hi)
+                except Exception:
+                    pass
+
             ch_min.valueChanged.connect(_apply_contrast)
             ch_max.valueChanged.connect(_apply_contrast)
 
-            # Initialize text fields
             ch_min_val.setText(str(int(ch_min.value())))
             ch_max_val.setText(str(int(ch_max.value())))
 
@@ -1327,43 +1628,38 @@ class UIWidget(QWidget):
 
         # Analysis buttons
         btns = QHBoxLayout()
-        analysis_btn = QPushButton('Data Analysis')
+
+        analysis_btn = QPushButton("Data Analysis")
         analysis_btn.clicked.connect(self.open_analysis)
         btns.addWidget(analysis_btn)
 
-        preprocess_btn = QPushButton('Pre-process Analysis')
+        preprocess_btn = QPushButton("Pre-process Analysis")
         preprocess_btn.clicked.connect(self.open_preprocess)
         btns.addWidget(preprocess_btn)
 
         layout.addLayout(btns)
-    
+
     def _suggest_export_dtype_and_scale(self, arr):
         """
         Export rules (no forced uint16 fallback):
         - Bool masks -> uint8 with values {0,1} (binary).
         - Float masks in [0,1] -> uint8 with values {0,1} (binary), preserving mask semantics.
         - Integer images -> preserve dtype exactly (uint8/uint16/int16/etc).
-        Note: “12-bit” camera data is almost always stored in a uint16 container in TIFF,
-        so dtype will still be uint16; you cannot reliably infer “12-bit” vs “16-bit”
-        from the NumPy dtype alone unless you saved that metadata somewhere 
-        - Float intensity (not mask-like) -> keep float32 (no scaling), to avoid inventing a bit depth.
+        - Float intensity (not mask-like) -> keep float32 (no scaling).
 
         Returns: (out_arr, out_dtype, suggested_contrast_limits)
         """
         a = np.asarray(arr)
 
-        # ---------- Bool mask: export as binary 0/1 ----------
         if a.dtype == np.bool_:
-            out = a.astype(np.uint8)  # 0 or 1
+            out = a.astype(np.uint8)
             return out, out.dtype, (0, 1)
 
-        # ---------- Integer images: preserve dtype ----------
         if np.issubdtype(a.dtype, np.integer):
-            out = a  # keep exactly
+            out = a
             info = np.iinfo(out.dtype)
             return out, out.dtype, (int(info.min), int(info.max))
 
-        # ---------- Float data ----------
         if np.issubdtype(a.dtype, np.floating):
             finite = a[np.isfinite(a)]
             if finite.size == 0:
@@ -1373,28 +1669,22 @@ class UIWidget(QWidget):
             amin = float(finite.min())
             amax = float(finite.max())
 
-            # Mask-like float (0..1): export as binary 0/1 (uint8)
-            # If you want to preserve probabilistic masks, change this to float32 passthrough.
             if amin >= -1e-6 and amax <= 1.0 + 1e-6:
-                out = (a > 0).astype(np.uint8)  # binary
+                out = (a > 0).astype(np.uint8)
                 return out, out.dtype, (0, 1)
 
-            # Float intensity: do NOT guess 8/12/16-bit. Preserve as float32.
-            # This avoids silently rescaling and changing quantitative values.
             out = a.astype(np.float32, copy=False)
             return out, out.dtype, (amin, amax)
 
-        # ---------- Unknown dtype fallback: preserve if possible ----------
-        # (e.g., complex -> float32 magnitude; adjust if you have such data)
         out = np.asarray(a)
         return out, out.dtype, (float(np.nanmin(out)), float(np.nanmax(out)))
-
 
     def _set_slider_from_lineedit(self, lineedit, slider, lo, hi):
         try:
             val = int(lineedit.text())
         except Exception:
             return
+
         val = max(int(lo), min(int(hi), val))
         try:
             lineedit.setText(str(int(val)))
@@ -1421,15 +1711,17 @@ class UIWidget(QWidget):
         op_val = QLineEdit(str(op.value()))
         op_val.setFixedWidth(60)
         op_val.setValidator(QIntValidator(0, 100))
+
         def _set_opacity(val):
             layer.opacity = int(val) / 100.0
             op_val.setText(str(int(val)))
+
         op.valueChanged.connect(_set_opacity)
         op_row.addWidget(op)
         op_row.addWidget(op_val)
         v.addLayout(op_row)
 
-        # Contrast limits (min/max)
+        # Contrast limits
         cl_row1 = QHBoxLayout()
         cl_row1.addWidget(QLabel("Min"))
         smin = QSlider(Qt.Horizontal)
@@ -1444,13 +1736,11 @@ class UIWidget(QWidget):
         cl_row2.addWidget(smax)
         v.addLayout(cl_row2)
 
-        # initialize from layer if present
         try:
             c0, c1 = layer.contrast_limits
         except Exception:
             c0, c1 = (0, 1) if is_binary else (0, max_range)
 
-        # clamp + set
         c0 = int(max(0, min(c0, smin.maximum())))
         c1 = int(max(0, min(c1, smax.maximum())))
         if c1 < c0:
@@ -1485,12 +1775,11 @@ class UIWidget(QWidget):
             self.layer_control_widgets = {}
 
         if key in self.layer_control_widgets:
-            return  # already have controls
+            return
 
         gb = QGroupBox(title or layer.name)
         vlay = QVBoxLayout(gb)
 
-        # Visibility + Opacity
         row = QHBoxLayout()
         vis = QCheckBox("Visible")
         vis.setChecked(True)
@@ -1505,20 +1794,25 @@ class UIWidget(QWidget):
         row.addWidget(op)
         vlay.addLayout(row)
 
-        # Contrast limits (simple version)
         try:
             mn, mx = layer.contrast_limits
         except Exception:
             mn, mx = 0, max_range
 
-        min_sl = QSlider(Qt.Horizontal); min_sl.setRange(0, max_range); min_sl.setValue(int(mn))
-        max_sl = QSlider(Qt.Horizontal); max_sl.setRange(0, max_range); max_sl.setValue(int(mx))
+        min_sl = QSlider(Qt.Horizontal)
+        min_sl.setRange(0, max_range)
+        min_sl.setValue(int(mn))
+
+        max_sl = QSlider(Qt.Horizontal)
+        max_sl.setRange(0, max_range)
+        max_sl.setValue(int(mx))
 
         def upd():
             try:
                 a = int(min_sl.value())
                 b = int(max_sl.value())
-                if b <= a: b = a + 1
+                if b <= a:
+                    b = a + 1
                 layer.contrast_limits = (a, b)
             except Exception:
                 pass
@@ -1532,94 +1826,13 @@ class UIWidget(QWidget):
         vlay.addWidget(max_sl)
 
         self.layer_control_widgets[key] = gb
-
-        # Put it somewhere: e.g. self.mask_container or a right dock widget layout you already have
         self.mask_container.addWidget(gb)
-
-    def z_changed(self, v):
-        v = int(v)
-        self.current_z = v
-
-        # ---- channels ----
-        for idx, ch in enumerate(self.channel_list):
-            arr = np.asarray(ch)
-            lyr = self.channel_layers[idx]
-            if arr.ndim == 3:
-                z = max(0, min(v, arr.shape[0] - 1))
-                lyr.data = arr[z]
-            else:
-                lyr.data = arr
-
-        # ---- masks ----
-        if hasattr(self, "masks_by_channel"):
-            for ch_idx, m3 in list(self.masks_by_channel.items()):
-                if m3 is None:
-                    continue
-                m3 = np.asarray(m3)
-                if m3.ndim == 2:
-                    m2 = (m3 > 0).astype(np.uint8)
-                else:
-                    z = max(0, min(v, m3.shape[0] - 1))
-                    m2 = (m3[z] > 0).astype(np.uint8)
-
-                lay = None
-                if hasattr(self, "mask_layers"):
-                    lay = self.mask_layers.get(ch_idx, None)
-                if lay is None:
-                    name = f"Channel {ch_idx+1} mask"
-                    try:
-                        lay = self.viewer.layers[name]
-                    except Exception:
-                        lay = None
-
-                if lay is not None:
-                    lay.data = m2
-                    try:
-                        lay.contrast_limits = (0, 1)
-                    except Exception:
-                        pass
-
-        # ---- derived (coloc/multiply) ----
-        if hasattr(self, "derived_stacks"):
-            self.derived_layers = getattr(self, "derived_layers", {})
-            for k, arr3 in list(self.derived_stacks.items()):
-                lay = self.derived_layers.get(k, None)
-                if lay is None:
-                    continue
-                arr3 = np.asarray(arr3)
-                if arr3.ndim == 3:
-                    z = max(0, min(v, arr3.shape[0] - 1))
-                    lay.data = arr3[z]
-                else:
-                    lay.data = arr3
-
-                    def _set_slider_from_lineedit(self, lineedit, slider, lo, hi):
-                        try:
-                            val = int(lineedit.text())
-                        except Exception:
-                            return
-                        val = max(lo, min(hi, val))
-                        slider.setValue(val)
-        # prune deleted coloc controls
-        if hasattr(self, "coloc_controls"):
-            alive = []
-            alive_boxes = []
-            for ctrl, box in zip(self.coloc_controls, getattr(self, "coloc_control_boxes", [])):
-                lay = ctrl.get("layer", None)
-                if lay is not None and lay in self.viewer.layers:
-                    alive.append(ctrl); alive_boxes.append(box)
-                else:
-                    try: box.setParent(None)
-                    except Exception: pass
-            self.coloc_controls = alive
-            self.coloc_control_boxes = alive_boxes
 
     def _add_channel_controls(self, layer, idx, max_range=65535):
         """Create UI controls for one channel and return (groupbox, ctrl_dict)."""
         gb = QGroupBox(f"Channel {idx} Controls")
         vlay = QVBoxLayout(gb)
 
-        # Visibility + Opacity row
         top_h = QHBoxLayout()
         vis_cb = QCheckBox("Visible")
         vis_cb.setChecked(True)
@@ -1633,8 +1846,8 @@ class UIWidget(QWidget):
         op.valueChanged.connect(lambda v, lyr=layer: setattr(lyr, "opacity", v / 100.0))
         top_h.addWidget(op)
 
-        # Color
         color_btn = QPushButton("Color")
+
         def make_color_picker(lyr):
             def pick():
                 col = QColorDialog.getColor(parent=self)
@@ -1644,37 +1857,24 @@ class UIWidget(QWidget):
                     except Exception:
                         pass
             return pick
+
         color_btn.clicked.connect(make_color_picker(layer))
         top_h.addWidget(color_btn)
 
         vlay.addLayout(top_h)
 
-        # ----------------------------------------------------------
-        # MIN/MAX CONTRAST LIMIT SLIDERS
-        # ----------------------------------------------------------
         lim = self.contrast_limits.get(f"ch{idx}", (0, max_range))
 
-        # Decide if this channel is "mask-like" (0..1)
-        is_unit_float = False
-        try:
-            lo0, hi0 = float(lim[0]), float(lim[1])
-            is_unit_float = (lo0 >= -1e-6 and hi0 <= 1.0 + 1e-6 and max_range == 1)
-        except Exception:
-            pass
-
         def to_slider(val):
-            # If using max_range==1 we keep 0/1 integer slider
             if max_range <= 1:
                 return int(round(float(val)))
             return int(round(float(val)))
 
         def from_slider(v):
-            # If max_range==1, return float 0.0/1.0 for napari
             if max_range <= 1:
                 return float(v)
             return float(v)
 
-        # Min
         ch_min_layout = QHBoxLayout()
         ch_min_layout.addWidget(QLabel("Min:"))
         ch_min = QSlider(Qt.Horizontal)
@@ -1691,7 +1891,6 @@ class UIWidget(QWidget):
         ch_min_layout.addWidget(ch_min_val)
         vlay.addLayout(ch_min_layout)
 
-        # Max
         ch_max_layout = QHBoxLayout()
         ch_max_layout.addWidget(QLabel("Max:"))
         ch_max = QSlider(Qt.Horizontal)
@@ -1708,9 +1907,15 @@ class UIWidget(QWidget):
         ch_max_layout.addWidget(ch_max_val)
         vlay.addLayout(ch_max_layout)
 
-        def _apply_contrast_from_sliders(_=None, lyr=layer,
-                                        smin=ch_min, smax=ch_max,
-                                        le_min=ch_min_val, le_max=ch_max_val):
+        def _apply_contrast_from_sliders(
+            _=None,
+            lyr=layer,
+            smin=ch_min,
+            smax=ch_max,
+            le_min=ch_min_val,
+            le_max=ch_max_val,
+            i=idx,
+        ):
             lo_i = int(smin.value())
             hi_i = int(smax.value())
 
@@ -1731,13 +1936,11 @@ class UIWidget(QWidget):
             except Exception:
                 pass
 
-            # Keep internal dict in the same float domain napari uses
-            self.contrast_limits[f"ch{idx}"] = (lo, hi)
+            self.contrast_limits[f"ch{i}"] = (lo, hi)
 
         ch_min.valueChanged.connect(_apply_contrast_from_sliders)
         ch_max.valueChanged.connect(_apply_contrast_from_sliders)
 
-        # normalize line edits
         ch_min_val.setText(str(int(ch_min.value())))
         ch_max_val.setText(str(int(ch_max.value())))
 
@@ -2726,7 +2929,2171 @@ class UIWidget(QWidget):
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open cell counter:\n{e}")
-            
+
+    def open_puncta_counter(self):
+        try:
+            import csv
+            import gc
+            import json
+            import traceback
+            from pathlib import Path
+
+            import numpy as np
+            import napari
+
+            from qtpy.QtCore import Qt, QEventLoop
+            from qtpy.QtWidgets import (
+                QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QMessageBox,
+                QDialog, QListWidget, QListWidgetItem, QDialogButtonBox,
+                QAbstractItemView, QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox,
+                QFileDialog, QScrollArea, QGroupBox, QInputDialog
+            )
+
+            from scipy import ndimage as ndi
+            from scipy.spatial import cKDTree
+
+            from skimage.measure import marching_cubes
+            from skimage.morphology import (
+                ball, binary_closing, binary_opening, binary_dilation, remove_small_objects
+            )
+
+            # ============================================================
+            # Lightweight helpers
+            # ============================================================
+            def _safe_stem(text):
+                text = str(text).strip() if text is not None else "unnamed"
+                text = Path(text).stem
+                text = "".join(ch if (ch.isalnum() or ch in ("_", "-", ".")) else "_" for ch in text)
+                return text or "unnamed"
+
+            def _round_int(x, default=0):
+                try:
+                    if x is None:
+                        return int(default)
+                    if isinstance(x, str) and not x.strip():
+                        return int(default)
+                    return int(round(float(x)))
+                except Exception:
+                    return int(default)
+
+            def _suggest_voxel_size():
+                suggested = None
+                try:
+                    vs = getattr(self, "voxel_size", None)
+                    if isinstance(vs, (list, tuple)) and len(vs) == 3:
+                        suggested = (float(vs[0]), float(vs[1]), float(vs[2]))
+                except Exception:
+                    pass
+
+                if suggested is None:
+                    suggested = (1.0, 1.0, 1.0)
+
+                z_um, ok1 = QInputDialog.getDouble(
+                    self, "Voxel size", "Z voxel size (µm):", float(suggested[0]), 1e-6, 1e9, 4
+                )
+                if not ok1:
+                    return None
+                y_um, ok2 = QInputDialog.getDouble(
+                    self, "Voxel size", "Y voxel size (µm):", float(suggested[1]), 1e-6, 1e9, 4
+                )
+                if not ok2:
+                    return None
+                x_um, ok3 = QInputDialog.getDouble(
+                    self, "Voxel size", "X voxel size (µm):", float(suggested[2]), 1e-6, 1e9, 4
+                )
+                if not ok3:
+                    return None
+
+                return (float(z_um), float(y_um), float(x_um))
+
+            def _warn_if_spacing_looks_swapped(spacing_zyx):
+                try:
+                    z, y, x = map(float, spacing_zyx)
+                    if z < min(y, x):
+                        QMessageBox.information(
+                            self,
+                            "Voxel size check",
+                            "You entered voxel size as (Z, Y, X).\n\n"
+                            f"Current values: ({z}, {y}, {x})\n\n"
+                            "Z is smaller than X/Y, which will compress the object along Z.\n"
+                            "If your microscope has larger spacing between slices than in-plane pixels,\n"
+                            "you may want something like (z_step_um, y_pixel_um, x_pixel_um)."
+                        )
+                except Exception:
+                    pass
+
+            def _fallback_color(name):
+                palette = [
+                    (1.0, 0.2, 0.2, 0.90),
+                    (0.2, 1.0, 0.2, 0.90),
+                    (0.2, 0.5, 1.0, 0.90),
+                    (1.0, 1.0, 0.2, 0.90),
+                    (1.0, 0.2, 1.0, 0.90),
+                    (0.2, 1.0, 1.0, 0.90),
+                ]
+                return palette[abs(hash(name)) % len(palette)]
+
+            def _hex_to_rgba(hex_str, alpha=0.90):
+                s = str(hex_str).strip()
+                if not s.startswith("#"):
+                    return None
+                h = s[1:]
+                if len(h) == 6:
+                    r = int(h[0:2], 16) / 255.0
+                    g = int(h[2:4], 16) / 255.0
+                    b = int(h[4:6], 16) / 255.0
+                    return (r, g, b, float(alpha))
+                if len(h) == 8:
+                    a = int(h[0:2], 16) / 255.0
+                    r = int(h[2:4], 16) / 255.0
+                    g = int(h[4:6], 16) / 255.0
+                    b = int(h[6:8], 16) / 255.0
+                    return (r, g, b, a)
+                return None
+
+            NAMED_RGBA = {
+                "red":     (1.0, 0.0, 0.0, 0.90),
+                "green":   (0.0, 1.0, 0.0, 0.90),
+                "blue":    (0.0, 0.4, 1.0, 0.90),
+                "magenta": (1.0, 0.0, 1.0, 0.90),
+                "cyan":    (0.0, 1.0, 1.0, 0.90),
+                "yellow":  (1.0, 1.0, 0.0, 0.90),
+                "gray":    (0.85, 0.85, 0.85, 0.90),
+                "grey":    (0.85, 0.85, 0.85, 0.90),
+                "orange":  (1.0, 0.55, 0.1, 0.90),
+                "white":   (1.0, 1.0, 1.0, 0.90),
+            }
+
+            def _rgba_from_layer_current(layer_obj, fallback_name):
+                if layer_obj is None:
+                    return _fallback_color(fallback_name)
+
+                cm = getattr(layer_obj, "colormap", None)
+                if cm is None:
+                    return _fallback_color(fallback_name)
+
+                if isinstance(cm, str):
+                    rgba = _hex_to_rgba(cm)
+                    if rgba is not None:
+                        return rgba
+                    if cm.lower() in NAMED_RGBA:
+                        return NAMED_RGBA[cm.lower()]
+                    return _fallback_color(fallback_name)
+
+                if isinstance(cm, tuple) and len(cm) >= 2:
+                    name = cm[0]
+                    cmap_obj = cm[1]
+
+                    if isinstance(name, str):
+                        rgba = _hex_to_rgba(name)
+                        if rgba is not None:
+                            return rgba
+                        if name.lower() in NAMED_RGBA:
+                            return NAMED_RGBA[name.lower()]
+
+                    try:
+                        if hasattr(cmap_obj, "map"):
+                            rgba = tuple(float(x) for x in cmap_obj.map([0.95])[0])
+                            if len(rgba) == 4:
+                                return (rgba[0], rgba[1], rgba[2], 0.90)
+                    except Exception:
+                        pass
+
+                try:
+                    if hasattr(cm, "map"):
+                        rgba = tuple(float(x) for x in cm.map([0.95])[0])
+                        if len(rgba) == 4:
+                            return (rgba[0], rgba[1], rgba[2], 0.90)
+                except Exception:
+                    pass
+
+                return _fallback_color(fallback_name)
+
+            def _configure_viewer_3d(vw, title):
+                vw.title = title
+                try:
+                    vw.scale_bar.visible = True
+                    vw.scale_bar.unit = "um"
+                    vw.scale_bar.font_size = 12
+                    vw.scale_bar.color = "white"
+                    vw.scale_bar.box = True
+                    vw.scale_bar.position = "bottom_right"
+                except Exception:
+                    pass
+                try:
+                    vw.dims.axis_labels = ["Z", "Y", "X"]
+                except Exception:
+                    pass
+
+            def _update_status(msg):
+                try:
+                    status_label.setText(str(msg))
+                except Exception:
+                    pass
+
+            def _current_spacing():
+                st = getattr(self, "_puncta_counter_state", None) or {}
+                sp = st.get("spacing_um", (1.0, 1.0, 1.0))
+                return (float(sp[0]), float(sp[1]), float(sp[2]))
+
+            def _set_spacing(sp):
+                st = self._puncta_counter_state
+                st["spacing_um"] = (float(sp[0]), float(sp[1]), float(sp[2]))
+                for lyr in st.get("surface_layers", {}).values():
+                    try:
+                        pass
+                    except Exception:
+                        pass
+                for lyr in st.get("point_layers", {}).values():
+                    try:
+                        lyr.scale = st["spacing_um"]
+                    except Exception:
+                        pass
+
+            def _ask_role_assignments(layer_names):
+                dlg = QDialog(self)
+                dlg.setWindowTitle("Puncta Counter: assign channel roles")
+                dlg.setMinimumWidth(520)
+                v = QVBoxLayout(dlg)
+
+                v.addWidget(QLabel("Assign channels to roles. Use 'None / N/A' for unused roles."))
+
+                none_label = "None / N/A"
+                role_combos = {}
+
+                for role in ["Cell of interest", "Protein 1", "Protein 2", "Protein 3"]:
+                    row = QHBoxLayout()
+                    row.addWidget(QLabel(role))
+                    combo = QComboBox()
+                    combo.addItem(none_label)
+                    for nm in layer_names:
+                        combo.addItem(nm)
+                    row.addWidget(combo)
+                    v.addLayout(row)
+                    role_combos[role] = combo
+
+                buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+                buttons.accepted.connect(dlg.accept)
+                buttons.rejected.connect(dlg.reject)
+                v.addWidget(buttons)
+
+                if dlg.exec() != QDialog.Accepted:
+                    return None
+
+                role_map = {}
+                for role, combo in role_combos.items():
+                    val = str(combo.currentText())
+                    role_map[role] = None if val == none_label else val
+
+                used = [x for x in role_map.values() if x is not None]
+                if not used:
+                    QMessageBox.information(self, "Puncta Counter", "No channels were assigned.")
+                    return None
+
+                if len(used) != len(set(used)):
+                    QMessageBox.warning(self, "Puncta Counter", "Each role must use a different channel.")
+                    return None
+
+                return role_map
+
+            def _resolve_source_layer(name):
+                try:
+                    return self.viewer.layers[name]
+                except Exception:
+                    return None
+
+            def _get_3d_array(name):
+                src = _resolve_source_layer(name)
+                if src is not None:
+                    try:
+                        arr = np.asarray(src.data)
+                        if arr.ndim == 3:
+                            return arr
+                    except Exception:
+                        pass
+                try:
+                    arr = np.asarray(self._resolve_stack3d(name))
+                    if arr.ndim == 3:
+                        return arr
+                except Exception:
+                    pass
+                return None
+
+            def _get_channel_list_from_role_map(role_map):
+                out = []
+                for role in ["Cell of interest", "Protein 1", "Protein 2", "Protein 3"]:
+                    ch = role_map.get(role, None)
+                    if ch is not None and ch not in out:
+                        out.append(ch)
+                return out
+
+            def _default_cell_params(channel_name, spacing):
+                return {
+                    "source_layer": str(channel_name),
+                    "voxel_size_um": [float(spacing[0]), float(spacing[1]), float(spacing[2])],
+                    "keep_largest_component": True,
+                    "fill_holes": True,
+                    "remove_small_objects_min_voxels": 50,
+                    "binary_closing_radius_px": 1,
+                    "binary_opening_radius_px": 0,
+                    "surface_smoothing_sigma_px": 0.0,
+                    "marching_cubes_step_size": 1,
+                }
+
+            def _default_protein_params(channel_name, spacing):
+                return {
+                    "source_layer": str(channel_name),
+                    "voxel_size_um": [float(spacing[0]), float(spacing[1]), float(spacing[2])],
+                    "surface_smoothing_sigma_px": 0.0,
+                    "marching_cubes_step_size": 1,
+                }
+
+            def _load_cell_metadata_file():
+                json_path, _ = QFileDialog.getOpenFileName(
+                    self,
+                    "Load cell-of-interest metadata",
+                    "",
+                    "JSON files (*.json)"
+                )
+                if not json_path:
+                    return None
+                try:
+                    with open(json_path, "r", encoding="utf-8") as f:
+                        payload = json.load(f)
+                    if not isinstance(payload, dict):
+                        raise ValueError("Metadata JSON does not contain a dictionary.")
+                    return payload
+                except Exception as e:
+                    QMessageBox.critical(self, "Load metadata", f"Failed to load metadata:\n{e}")
+                    return None
+
+            def _save_cell_metadata_file(payload, default_name):
+                save_path, _ = QFileDialog.getSaveFileName(
+                    self,
+                    "Save meta data from cell of interest",
+                    default_name,
+                    "JSON files (*.json)"
+                )
+                if not save_path:
+                    return None
+                if not str(save_path).lower().endswith(".json"):
+                    save_path = str(save_path) + ".json"
+                try:
+                    with open(save_path, "w", encoding="utf-8") as f:
+                        json.dump(payload, f, indent=2)
+                    return save_path
+                except Exception as e:
+                    QMessageBox.critical(self, "Save metadata", f"Failed to save metadata:\n{e}")
+                    return None
+
+            # ============================================================
+            # Bounding-box helpers
+            # ============================================================
+            def _mask_bbox(mask):
+                if mask is None or mask.ndim != 3 or not np.any(mask):
+                    return None
+
+                z_any = np.any(mask, axis=(1, 2))
+                y_any = np.any(mask, axis=(0, 2))
+                x_any = np.any(mask, axis=(0, 1))
+
+                z_idx = np.where(z_any)[0]
+                y_idx = np.where(y_any)[0]
+                x_idx = np.where(x_any)[0]
+
+                if len(z_idx) == 0 or len(y_idx) == 0 or len(x_idx) == 0:
+                    return None
+
+                return (
+                    int(z_idx[0]), int(z_idx[-1]),
+                    int(y_idx[0]), int(y_idx[-1]),
+                    int(x_idx[0]), int(x_idx[-1]),
+                )
+
+            def _expand_bbox(bbox, shape, margin_zyx):
+                z0, z1, y0, y1, x0, x1 = bbox
+                mz, my, mx = margin_zyx
+                return (
+                    max(0, int(z0 - mz)),
+                    min(shape[0] - 1, int(z1 + mz)),
+                    max(0, int(y0 - my)),
+                    min(shape[1] - 1, int(y1 + my)),
+                    max(0, int(x0 - mx)),
+                    min(shape[2] - 1, int(x1 + mx)),
+                )
+
+            def _bbox_to_slices(bbox):
+                return (
+                    slice(int(bbox[0]), int(bbox[1]) + 1),
+                    slice(int(bbox[2]), int(bbox[3]) + 1),
+                    slice(int(bbox[4]), int(bbox[5]) + 1),
+                )
+
+            def _bbox_from_coords(coords_zyx):
+                arr = np.asarray(coords_zyx, dtype=np.int32)
+                mn = arr.min(axis=0)
+                mx = arr.max(axis=0)
+                return (
+                    int(mn[0]), int(mx[0]),
+                    int(mn[1]), int(mx[1]),
+                    int(mn[2]), int(mx[2]),
+                )
+
+            def _bboxes_intersect(a, b):
+                return not (
+                    a[1] < b[0] or b[1] < a[0] or
+                    a[3] < b[2] or b[3] < a[2] or
+                    a[5] < b[4] or b[5] < a[4]
+                )
+
+            # ============================================================
+            # Surface helpers
+            # ============================================================
+            def _surface_from_binary(mask, spacing, src_layer, fallback_name, sigma_px=0.0, step_size=1):
+                arr = np.asarray(mask, dtype=np.uint8)
+                if arr.ndim != 3:
+                    raise ValueError("Input mask is not 3D.")
+                if not np.any(arr):
+                    raise ValueError("Input mask is empty.")
+
+                if float(sigma_px) > 0:
+                    work = ndi.gaussian_filter(arr.astype(np.float32), sigma=float(sigma_px))
+                else:
+                    work = arr.astype(np.float32)
+
+                verts, faces, normals, values = marching_cubes(
+                    work,
+                    level=0.5,
+                    spacing=spacing,
+                    step_size=max(1, int(step_size)),
+                )
+                rgba = _rgba_from_layer_current(src_layer, fallback_name)
+                vertex_colors = np.tile(np.array(rgba, dtype=np.float32), (verts.shape[0], 1))
+
+                out = {
+                    "verts": np.asarray(verts, dtype=np.float32),
+                    "faces": np.asarray(faces, dtype=np.int32),
+                    "values": np.asarray(values, dtype=np.float32),
+                    "vertex_colors": np.asarray(vertex_colors, dtype=np.float32),
+                }
+
+                del arr, work, normals
+                gc.collect()
+                return out
+
+            def _write_obj(obj_path, verts_zyx_um, faces):
+                verts_zyx_um = np.asarray(verts_zyx_um, dtype=float)
+                faces = np.asarray(faces, dtype=np.int32)
+                with open(obj_path, "w", encoding="utf-8") as f:
+                    f.write("# Exported from puncta counter\n")
+                    f.write("# Coordinates stored in microns\n")
+                    for v in verts_zyx_um:
+                        z, y, x = float(v[0]), float(v[1]), float(v[2])
+                        f.write(f"v {x:.4f} {y:.4f} {z:.4f}\n")
+                    for tri in faces:
+                        a, b, c = int(tri[0]) + 1, int(tri[1]) + 1, int(tri[2]) + 1
+                        f.write(f"f {a} {b} {c}\n")
+
+            # ============================================================
+            # Preview parameter dialogs
+            # ============================================================
+            def _edit_cell_params(initial_params, channel_name):
+                params = dict(initial_params)
+
+                dlg = QDialog(self)
+                dlg.setWindowTitle(f"Cell-of-interest mesh parameters: {channel_name}")
+                dlg.setMinimumWidth(460)
+                v = QVBoxLayout(dlg)
+
+                keep_largest_ck = QCheckBox("Keep largest connected component only")
+                keep_largest_ck.setChecked(bool(params.get("keep_largest_component", True)))
+                v.addWidget(keep_largest_ck)
+
+                fill_holes_ck = QCheckBox("Fill internal holes for watertight mesh")
+                fill_holes_ck.setChecked(bool(params.get("fill_holes", True)))
+                v.addWidget(fill_holes_ck)
+
+                row1 = QHBoxLayout()
+                row1.addWidget(QLabel("Remove objects smaller than (voxels)"))
+                min_obj = QSpinBox()
+                min_obj.setRange(0, 100000000)
+                min_obj.setValue(int(params.get("remove_small_objects_min_voxels", 50)))
+                row1.addWidget(min_obj)
+                v.addLayout(row1)
+
+                row2 = QHBoxLayout()
+                row2.addWidget(QLabel("Binary closing radius (px)"))
+                close_r = QSpinBox()
+                close_r.setRange(0, 20)
+                close_r.setValue(int(params.get("binary_closing_radius_px", 1)))
+                row2.addWidget(close_r)
+                v.addLayout(row2)
+
+                row3 = QHBoxLayout()
+                row3.addWidget(QLabel("Binary opening radius (px)"))
+                open_r = QSpinBox()
+                open_r.setRange(0, 20)
+                open_r.setValue(int(params.get("binary_opening_radius_px", 0)))
+                row3.addWidget(open_r)
+                v.addLayout(row3)
+
+                row4 = QHBoxLayout()
+                row4.addWidget(QLabel("Surface smoothing sigma (px)"))
+                sigma = QDoubleSpinBox()
+                sigma.setDecimals(2)
+                sigma.setRange(0.0, 10.0)
+                sigma.setValue(float(params.get("surface_smoothing_sigma_px", 0.0)))
+                row4.addWidget(sigma)
+                v.addLayout(row4)
+
+                row5 = QHBoxLayout()
+                row5.addWidget(QLabel("Marching cubes step size"))
+                mc_step = QSpinBox()
+                mc_step.setRange(1, 8)
+                mc_step.setValue(int(params.get("marching_cubes_step_size", 1)))
+                row5.addWidget(mc_step)
+                v.addLayout(row5)
+
+                buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+                buttons.accepted.connect(dlg.accept)
+                buttons.rejected.connect(dlg.reject)
+                v.addWidget(buttons)
+
+                if dlg.exec() != QDialog.Accepted:
+                    return None
+
+                params["keep_largest_component"] = bool(keep_largest_ck.isChecked())
+                params["fill_holes"] = bool(fill_holes_ck.isChecked())
+                params["remove_small_objects_min_voxels"] = int(min_obj.value())
+                params["binary_closing_radius_px"] = int(close_r.value())
+                params["binary_opening_radius_px"] = int(open_r.value())
+                params["surface_smoothing_sigma_px"] = float(sigma.value())
+                params["marching_cubes_step_size"] = int(mc_step.value())
+                return params
+
+            def _edit_protein_params(initial_params, role_label, channel_name):
+                params = dict(initial_params)
+
+                dlg = QDialog(self)
+                dlg.setWindowTitle(f"{role_label} mesh parameters: {channel_name}")
+                dlg.setMinimumWidth(420)
+                v = QVBoxLayout(dlg)
+
+                row1 = QHBoxLayout()
+                row1.addWidget(QLabel("Surface smoothing sigma (px)"))
+                sigma = QDoubleSpinBox()
+                sigma.setDecimals(2)
+                sigma.setRange(0.0, 10.0)
+                sigma.setValue(float(params.get("surface_smoothing_sigma_px", 0.0)))
+                row1.addWidget(sigma)
+                v.addLayout(row1)
+
+                row2 = QHBoxLayout()
+                row2.addWidget(QLabel("Marching cubes step size"))
+                mc_step = QSpinBox()
+                mc_step.setRange(1, 8)
+                mc_step.setValue(int(params.get("marching_cubes_step_size", 1)))
+                row2.addWidget(mc_step)
+                v.addLayout(row2)
+
+                buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+                buttons.accepted.connect(dlg.accept)
+                buttons.rejected.connect(dlg.reject)
+                v.addWidget(buttons)
+
+                if dlg.exec() != QDialog.Accepted:
+                    return None
+
+                params["surface_smoothing_sigma_px"] = float(sigma.value())
+                params["marching_cubes_step_size"] = int(mc_step.value())
+                return params
+
+            # ============================================================
+            # Preview builders
+            # ============================================================
+            def _build_clean_cell_mask(cell_vol, params):
+                mask = np.asarray(cell_vol) > 0
+                if mask.ndim != 3:
+                    raise ValueError("Cell-of-interest channel must be a 3D binary mask.")
+
+                if int(params.get("binary_closing_radius_px", 0)) > 0:
+                    mask = binary_closing(mask, footprint=ball(int(params["binary_closing_radius_px"])))
+
+                if int(params.get("binary_opening_radius_px", 0)) > 0:
+                    mask = binary_opening(mask, footprint=ball(int(params["binary_opening_radius_px"])))
+
+                if bool(params.get("fill_holes", True)):
+                    mask = ndi.binary_fill_holes(mask)
+
+                min_vox = int(params.get("remove_small_objects_min_voxels", 0))
+                if min_vox > 0:
+                    mask = remove_small_objects(mask.astype(bool), min_size=min_vox)
+                    mask = np.asarray(mask, dtype=bool)
+
+                if bool(params.get("keep_largest_component", True)):
+                    lab, n = ndi.label(mask)
+                    if n > 0:
+                        counts = np.bincount(lab.ravel())
+                        counts[0] = 0
+                        keep_id = int(np.argmax(counts))
+                        mask = (lab == keep_id)
+                    del lab, counts
+                    gc.collect()
+
+                if bool(params.get("fill_holes", True)):
+                    mask = ndi.binary_fill_holes(mask)
+
+                return np.asarray(mask, dtype=bool)
+
+            def _prepare_cell_role(channel_name, spacing, params):
+                vol = _get_3d_array(channel_name)
+                if vol is None:
+                    raise RuntimeError(f"Could not resolve 3D data for {channel_name}")
+
+                clean_mask = _build_clean_cell_mask(vol, params)
+                if not np.any(clean_mask):
+                    raise ValueError("Cell mask is empty after cleanup.")
+
+                src_layer = _resolve_source_layer(channel_name)
+                surf = _surface_from_binary(
+                    clean_mask,
+                    spacing=spacing,
+                    src_layer=src_layer,
+                    fallback_name=channel_name,
+                    sigma_px=float(params.get("surface_smoothing_sigma_px", 0.0)),
+                    step_size=int(params.get("marching_cubes_step_size", 1)),
+                )
+
+                try:
+                    tree = cKDTree(surf["verts"])
+                except Exception:
+                    tree = None
+
+                metadata = dict(params)
+                metadata["source_layer"] = str(channel_name)
+                metadata["voxel_size_um"] = [float(spacing[0]), float(spacing[1]), float(spacing[2])]
+
+                result = {
+                    "role": "Cell of interest",
+                    "kind": "cell",
+                    "channel": channel_name,
+                    "surface": surf,
+                    "clean_mask": clean_mask,
+                    "surface_tree": tree,
+                    "metadata": metadata,
+                }
+
+                gc.collect()
+                return result
+
+            def _prepare_protein_role(role_label, channel_name, spacing, params):
+                vol = _get_3d_array(channel_name)
+                if vol is None:
+                    raise RuntimeError(f"Could not resolve 3D data for {channel_name}")
+
+                protein_mask = np.asarray(vol) > 0
+                if not np.any(protein_mask):
+                    raise ValueError(f"{role_label}: no positive voxels found.")
+
+                src_layer = _resolve_source_layer(channel_name)
+                surf = _surface_from_binary(
+                    protein_mask,
+                    spacing=spacing,
+                    src_layer=src_layer,
+                    fallback_name=channel_name,
+                    sigma_px=float(params.get("surface_smoothing_sigma_px", 0.0)),
+                    step_size=int(params.get("marching_cubes_step_size", 1)),
+                )
+
+                result = {
+                    "role": role_label,
+                    "kind": "protein",
+                    "channel": channel_name,
+                    "surface": surf,
+                    "metadata": dict(params),
+                }
+
+                del protein_mask
+                gc.collect()
+                return result
+
+            def _preview_result_loop(role_label, result_obj, spacing):
+                pv = napari.Viewer(ndisplay=3)
+                _configure_viewer_3d(pv, f"Preview: {role_label}")
+
+                surf = result_obj["surface"]
+                pv.add_surface(
+                    (surf["verts"], surf["faces"], surf["values"]),
+                    name=f"{role_label} surface",
+                    shading="smooth",
+                    vertex_colors=surf["vertex_colors"],
+                )
+
+                ctrl = QDialog(self)
+                ctrl.setWindowTitle(f"{role_label} preview decision")
+                ctrl.setMinimumWidth(420)
+                cv = QVBoxLayout(ctrl)
+                cv.addWidget(QLabel(
+                    f"Inspect the preview viewer for {role_label}.\n"
+                    f"Accept = use this mesh in the final analysis viewer.\n"
+                    f"Rerun = close preview and choose new parameters."
+                ))
+
+                btn_row = QHBoxLayout()
+                accept_btn = QPushButton("Accept")
+                rerun_btn = QPushButton("Rerun")
+                cancel_btn = QPushButton("Cancel / Skip")
+                btn_row.addWidget(accept_btn)
+                btn_row.addWidget(rerun_btn)
+                btn_row.addWidget(cancel_btn)
+                cv.addLayout(btn_row)
+
+                decision = {"value": "cancel"}
+
+                def _finish(val):
+                    decision["value"] = val
+                    try:
+                        ctrl.done(0)
+                    except Exception:
+                        try:
+                            ctrl.close()
+                        except Exception:
+                            pass
+
+                accept_btn.clicked.connect(lambda _=False: _finish("accept"))
+                rerun_btn.clicked.connect(lambda _=False: _finish("rerun"))
+                cancel_btn.clicked.connect(lambda _=False: _finish("cancel"))
+
+                loop = QEventLoop()
+                ctrl.finished.connect(loop.quit)
+                ctrl.show()
+                loop.exec()
+
+                try:
+                    ctrl.close()
+                except Exception:
+                    pass
+                try:
+                    pv.close()
+                except Exception:
+                    pass
+
+                gc.collect()
+                return decision["value"]
+
+            def _run_role_preview(role_label, channel_name, spacing, is_cell=False):
+                if is_cell:
+                    params = _default_cell_params(channel_name, spacing)
+                    ask_load = QMessageBox.question(
+                        self,
+                        "Cell mesh metadata",
+                        "Do you want to load cell-of-interest metadata before creating the mesh?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No,
+                    )
+                    if ask_load == QMessageBox.Yes:
+                        payload = _load_cell_metadata_file()
+                        if payload is not None:
+                            for k, v in payload.items():
+                                params[k] = v
+                            params["source_layer"] = str(channel_name)
+                            params["voxel_size_um"] = [float(spacing[0]), float(spacing[1]), float(spacing[2])]
+                else:
+                    params = _default_protein_params(channel_name, spacing)
+
+                while True:
+                    if is_cell:
+                        edited = _edit_cell_params(params, channel_name)
+                    else:
+                        edited = _edit_protein_params(params, role_label, channel_name)
+
+                    if edited is None:
+                        return None
+
+                    params = dict(edited)
+
+                    try:
+                        if is_cell:
+                            result = _prepare_cell_role(channel_name, spacing, params)
+                        else:
+                            result = _prepare_protein_role(role_label, channel_name, spacing, params)
+                    except Exception as e:
+                        QMessageBox.critical(
+                            self,
+                            f"{role_label} preview",
+                            f"Failed to build preview for {role_label} ({channel_name}):\n{e}"
+                        )
+                        continue
+
+                    decision = _preview_result_loop(role_label, result, spacing)
+                    if decision == "accept":
+                        return result
+                    if decision == "rerun":
+                        if result.get("kind") == "cell":
+                            try:
+                                del result["clean_mask"]
+                            except Exception:
+                                pass
+                        del result
+                        gc.collect()
+                        continue
+
+                    if result.get("kind") == "cell":
+                        try:
+                            del result["clean_mask"]
+                        except Exception:
+                            pass
+                    del result
+                    gc.collect()
+                    return None
+
+            # ============================================================
+            # Initial setup
+            # ============================================================
+            layer_names = [lyr.name for lyr in self.viewer.layers]
+            if not layer_names:
+                QMessageBox.warning(self, "No layers", "No layers found in viewer.")
+                return
+
+            spacing0 = _suggest_voxel_size()
+            if spacing0 is None:
+                return
+            _warn_if_spacing_looks_swapped(spacing0)
+
+            role_map = _ask_role_assignments(layer_names)
+            if role_map is None:
+                return
+
+            selected_channels = _get_channel_list_from_role_map(role_map)
+            available_channels = []
+            bad_channels = []
+            for nm in selected_channels:
+                arr = _get_3d_array(nm)
+                if arr is None or arr.ndim != 3:
+                    bad_channels.append(nm)
+                else:
+                    available_channels.append(nm)
+
+            if not available_channels:
+                QMessageBox.warning(
+                    self,
+                    "Puncta Counter",
+                    "No valid 3D channels could be resolved for the assigned roles."
+                )
+                return
+
+            if bad_channels:
+                QMessageBox.information(
+                    self,
+                    "Puncta Counter",
+                    "These assigned channels could not be resolved as 3D and will be skipped:\n\n"
+                    + "\n".join(bad_channels)
+                )
+
+            accepted_roles = {}
+            ordered_roles = ["Cell of interest", "Protein 1", "Protein 2", "Protein 3"]
+
+            for role in ordered_roles:
+                ch = role_map.get(role, None)
+                if ch is None or ch not in available_channels:
+                    continue
+
+                try:
+                    res = _run_role_preview(
+                        role_label=role,
+                        channel_name=ch,
+                        spacing=spacing0,
+                        is_cell=(role == "Cell of interest"),
+                    )
+                except Exception as e:
+                    QMessageBox.critical(self, "Puncta Counter", f"{role}: preview failed:\n{e}")
+                    res = None
+
+                if res is None:
+                    skip = QMessageBox.question(
+                        self,
+                        "Skip role",
+                        f"{role} was not accepted.\n\nDo you want to skip this role and continue?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.Yes,
+                    )
+                    if skip == QMessageBox.No:
+                        return
+                    continue
+
+                accepted_roles[role] = res
+
+            if not accepted_roles:
+                QMessageBox.information(self, "Puncta Counter", "No channels were accepted for the final viewer.")
+                return
+
+            # ============================================================
+            # Final viewer - surfaces/points only
+            # ============================================================
+            pc = napari.Viewer(ndisplay=3)
+            _configure_viewer_3d(pc, "Puncta Counter")
+
+            cell_result = accepted_roles.get("Cell of interest", None)
+            protein_roles = [r for r in ["Protein 1", "Protein 2", "Protein 3"] if r in accepted_roles]
+            protein_channels = [accepted_roles[r]["channel"] for r in protein_roles]
+
+            self._puncta_counter_state = {
+                "viewer": pc,
+                "spacing_um": tuple(spacing0),
+                "role_map": dict(role_map),
+                "accepted_roles": accepted_roles,
+                "surface_layers": {},
+                "point_layers": {},
+                "analysis_cache": {},
+                "cell_channel_name": cell_result["channel"] if cell_result is not None else "",
+                "cell_mask": cell_result["clean_mask"] if cell_result is not None else None,
+                "cell_bbox": _mask_bbox(cell_result["clean_mask"]) if cell_result is not None else None,
+                "cell_mesh_verts_zyx_um": None if cell_result is None else np.asarray(cell_result["surface"]["verts"], dtype=np.float32),
+                "cell_mesh_faces": None if cell_result is None else np.asarray(cell_result["surface"]["faces"], dtype=np.int32),
+                "cell_surface_tree": None if cell_result is None else cell_result.get("surface_tree", None),
+                "cell_mesh_metadata": {} if cell_result is None else dict(cell_result.get("metadata", {})),
+                "cell_mesh_metadata_path": "",
+                "protein_channels": list(protein_channels),
+            }
+            st = self._puncta_counter_state
+
+            def _upsert_surface_layer(layer_name, surf_dict, shading="smooth", visible=True):
+                if surf_dict is None:
+                    return None
+                verts = np.asarray(surf_dict["verts"], dtype=np.float32)
+                faces = np.asarray(surf_dict["faces"], dtype=np.int32)
+                values = np.asarray(surf_dict["values"], dtype=np.float32)
+                vertex_colors = np.asarray(surf_dict["vertex_colors"], dtype=np.float32)
+
+                existing = st["surface_layers"].get(layer_name, None)
+                if existing is None:
+                    lyr = pc.add_surface(
+                        (verts, faces, values),
+                        name=layer_name,
+                        shading=shading,
+                        vertex_colors=vertex_colors,
+                    )
+                    try:
+                        lyr.visible = visible
+                    except Exception:
+                        pass
+                    st["surface_layers"][layer_name] = lyr
+                    return lyr
+
+                try:
+                    existing.data = (verts, faces, values)
+                    existing.vertex_colors = vertex_colors
+                    existing.visible = visible
+                    return existing
+                except Exception:
+                    try:
+                        pc.layers.remove(existing)
+                    except Exception:
+                        pass
+                    lyr = pc.add_surface(
+                        (verts, faces, values),
+                        name=layer_name,
+                        shading=shading,
+                        vertex_colors=vertex_colors,
+                    )
+                    try:
+                        lyr.visible = visible
+                    except Exception:
+                        pass
+                    st["surface_layers"][layer_name] = lyr
+                    return lyr
+
+        
+
+            for role in ordered_roles:
+                if role not in accepted_roles:
+                    continue
+                res = accepted_roles[role]
+                ch = res["channel"]
+                _upsert_surface_layer(
+                    f"{role} surface - {ch}",
+                    res["surface"],
+                    shading="smooth",
+                    visible=True
+                )
+
+            # ============================================================
+            # Analysis helpers
+            # ============================================================
+            def _current_cell_metadata_payload():
+                payload = dict(st.get("cell_mesh_metadata", {}) or {})
+                payload["source_layer"] = str(st.get("cell_channel_name", ""))
+                payload["voxel_size_um"] = [float(x) for x in _current_spacing()]
+                return payload
+
+            def _save_cell_metadata_dialog():
+                if st.get("cell_mask", None) is None:
+                    QMessageBox.warning(self, "Save metadata", "No cell-of-interest mesh exists.")
+                    return
+                default_name = f"{_safe_stem(st.get('cell_channel_name', 'cell_of_interest'))}_cell_of_interest_mesh.json"
+                save_path = _save_cell_metadata_file(_current_cell_metadata_payload(), default_name)
+                if save_path:
+                    st["cell_mesh_metadata_path"] = save_path
+                    _update_status(f"Saved cell metadata: {save_path}")
+                    QMessageBox.information(self, "Metadata saved", f"Saved metadata to:\n{save_path}")
+
+            def _export_cell_mesh_obj():
+                verts = st.get("cell_mesh_verts_zyx_um", None)
+                faces = st.get("cell_mesh_faces", None)
+                if verts is None or faces is None or len(verts) == 0:
+                    QMessageBox.warning(self, "Export cell mesh", "No cell mesh exists yet.")
+                    return
+
+                cell_nm = str(st.get("cell_channel_name", "cell_of_interest"))
+                suggested = f"{_safe_stem(cell_nm)}_cell_of_interest.obj"
+                obj_path, _ = QFileDialog.getSaveFileName(
+                    self,
+                    "Export cell mesh OBJ",
+                    suggested,
+                    "OBJ files (*.obj)"
+                )
+                if not obj_path:
+                    return
+                if not str(obj_path).lower().endswith(".obj"):
+                    obj_path = str(obj_path) + ".obj"
+
+                try:
+                    _write_obj(obj_path, verts, faces)
+                    meta_path = str(Path(obj_path).with_suffix(".json"))
+
+                    payload = _current_cell_metadata_payload()
+                    payload["exported_obj"] = str(obj_path)
+                    payload["vertex_count"] = int(len(verts))
+                    payload["face_count"] = int(len(faces))
+
+                    with open(meta_path, "w", encoding="utf-8") as f:
+                        json.dump(payload, f, indent=2)
+
+                    QMessageBox.information(
+                        self,
+                        "Export cell mesh",
+                        f"Saved OBJ:\n{obj_path}\n\nSaved JSON:\n{meta_path}"
+                    )
+                    _update_status(f"Exported cell OBJ: {obj_path}")
+                except Exception as e:
+                    QMessageBox.critical(self, "Export cell mesh", f"Failed to export OBJ:\n{e}")
+
+            def _get_selected_protein_channels():
+                out = []
+                for i in range(protein_channel_list.count()):
+                    it = protein_channel_list.item(i)
+                    if it.checkState() == Qt.Checked:
+                        ch = it.data(Qt.UserRole)
+                        if ch:
+                            out.append(str(ch))
+                return out
+
+            def _sync_localization_combos():
+                selected = _get_selected_protein_channels()
+                cur_a = str(loc_ch_a.currentText()) if loc_ch_a.count() else ""
+                cur_b = str(loc_ch_b.currentText()) if loc_ch_b.count() else ""
+
+                loc_ch_a.blockSignals(True)
+                loc_ch_b.blockSignals(True)
+
+                loc_ch_a.clear()
+                loc_ch_b.clear()
+                for nm in selected:
+                    loc_ch_a.addItem(nm)
+                    loc_ch_b.addItem(nm)
+
+                if cur_a in selected:
+                    loc_ch_a.setCurrentText(cur_a)
+                if cur_b in selected:
+                    loc_ch_b.setCurrentText(cur_b)
+                elif len(selected) >= 2:
+                    loc_ch_b.setCurrentIndex(1)
+
+                loc_ch_a.blockSignals(False)
+                loc_ch_b.blockSignals(False)
+
+            def _sync_loc_mode_widgets():
+                is_centroid = str(loc_mode.currentText()).startswith("Centroid")
+                loc_centroid_tol_um.setEnabled(is_centroid)
+                loc_voxel_overlap_pct.setEnabled(not is_centroid)
+
+            def _centroid_inside_mask(mask, centroid_pix):
+                shp = mask.shape
+                zi = int(np.clip(np.round(centroid_pix[0]), 0, shp[0] - 1))
+                yi = int(np.clip(np.round(centroid_pix[1]), 0, shp[1] - 1))
+                xi = int(np.clip(np.round(centroid_pix[2]), 0, shp[2] - 1))
+                return bool(mask[zi, yi, xi])
+
+            def _analysis_crop_bbox(shell_um):
+                cell_mask = st.get("cell_mask", None)
+                bbox = st.get("cell_bbox", None)
+                if cell_mask is None or bbox is None:
+                    return None
+
+                sp = _current_spacing()
+                mz = int(np.ceil(float(shell_um) / max(float(sp[0]), 1e-9)))
+                my = int(np.ceil(float(shell_um) / max(float(sp[1]), 1e-9)))
+                mx = int(np.ceil(float(shell_um) / max(float(sp[2]), 1e-9)))
+
+                margin = (max(1, mz), max(1, my), max(1, mx))
+                return _expand_bbox(bbox, cell_mask.shape, margin)
+
+            def _channel_role_name(ch):
+                for role, obj in accepted_roles.items():
+                    if obj["channel"] == ch:
+                        return role
+                return ""
+
+            def _prepare_roi_binary(channel_name, threshold_value, shell_um):
+                vol = _get_3d_array(channel_name)
+                if vol is None:
+                    raise RuntimeError(f"Could not resolve 3D data for channel: {channel_name}")
+
+                cell_mask = st.get("cell_mask", None)
+                if cell_mask is None:
+                    raise RuntimeError("Cell-of-interest mesh must exist first.")
+
+                bbox = _analysis_crop_bbox(shell_um)
+                if bbox is None:
+                    raise RuntimeError("Cell mask bbox could not be determined.")
+
+                slc = _bbox_to_slices(bbox)
+
+                vol_crop = np.asarray(vol[slc])
+                cell_crop = np.asarray(cell_mask[slc], dtype=bool)
+
+                thr = float(threshold_value)
+                binary_crop = np.asarray(vol_crop > thr, dtype=bool)
+
+                if float(shell_um) <= 0:
+                    roi_mask = cell_crop
+                else:
+                    spacing = tuple(float(x) for x in _current_spacing())
+                    outside_dist_um = ndi.distance_transform_edt(~cell_crop, sampling=spacing)
+                    roi_mask = cell_crop | (outside_dist_um <= float(shell_um))
+                    del outside_dist_um
+
+                binary_crop &= roi_mask
+
+                del roi_mask
+                gc.collect()
+                return binary_crop, cell_crop, vol_crop, bbox
+
+            def _analyze_puncta_channel(channel_name, store_coords=False, add_layers=True):
+                cell_mask = st.get("cell_mask", None)
+                tree = st.get("cell_surface_tree", None)
+                if cell_mask is None or tree is None:
+                    raise RuntimeError("Cell-of-interest mesh must exist first.")
+
+                shell_um = float(surface_shell_um.value())
+                binary_crop, cell_crop, vol_crop, crop_bbox = _prepare_roi_binary(
+                    channel_name,
+                    threshold_value=float(puncta_voxel_threshold.value()),
+                    shell_um=shell_um,
+                )
+
+                if binary_crop.ndim != 3:
+                    raise RuntimeError("Binary crop is not 3D.")
+
+                displayed_layer_name = f"Displayed puncta centroids - {channel_name}"
+                all_layer_name = f"All puncta centroids - {channel_name}"
+
+                if not np.any(binary_crop):
+                    if add_layers:
+                        _upsert_points_layer(displayed_layer_name, np.zeros((0, 3)), face_color="cyan", size=6, visible=True)
+                        _upsert_points_layer(all_layer_name, np.zeros((0, 3)), face_color="yellow", size=5, visible=False)
+
+                    del binary_crop, cell_crop, vol_crop
+                    gc.collect()
+                    return {
+                        "channel": channel_name,
+                        "rows": [],
+                        "summary": {
+                            "total": 0,
+                            "inside": 0,
+                            "shell_only": 0,
+                            "displayed": 0,
+                        }
+                    }
+
+                lbl, _ = ndi.label(binary_crop)
+                objs = ndi.find_objects(lbl)
+
+                rows = []
+                displayed_points = []
+                all_points = []
+
+                overlap_thr = float(inside_frac.value()) / 100.0
+                display_min_px = int(display_min_pixels.value())
+
+                n_total = 0
+                n_inside = 0
+                n_shell_only = 0
+                n_displayed = 0
+
+                base_z, _, base_y, _, base_x, _ = crop_bbox
+                sp = np.array(_current_spacing(), dtype=np.float32)
+
+                for puncta_id, slc in enumerate(objs, start=1):
+                    if slc is None:
+                        continue
+
+                    local_mask = (lbl[slc] == puncta_id)
+                    if not np.any(local_mask):
+                        continue
+
+                    local_coords = np.argwhere(local_mask).astype(np.int32)
+                    z0 = int(slc[0].start)
+                    y0 = int(slc[1].start)
+                    x0 = int(slc[2].start)
+
+                    crop_coords = local_coords + np.array([[z0, y0, x0]], dtype=np.int32)
+                    global_coords = crop_coords + np.array([[base_z, base_y, base_x]], dtype=np.int32)
+
+                    pixel_count = int(global_coords.shape[0])
+                    centroid_pix = global_coords.mean(axis=0).astype(np.float32)
+                    centroid_phys_zyx = centroid_pix * sp
+
+                    intens_vals = vol_crop[
+                        crop_coords[:, 0],
+                        crop_coords[:, 1],
+                        crop_coords[:, 2]
+                    ]
+
+                    mean_intensity = _round_int(np.mean(intens_vals)) if intens_vals.size else 0
+                    max_intensity = _round_int(np.max(intens_vals)) if intens_vals.size else 0
+
+                    cell_overlap_vals = cell_mask[
+                        global_coords[:, 0],
+                        global_coords[:, 1],
+                        global_coords[:, 2]
+                    ]
+                    overlap_frac = float(np.mean(cell_overlap_vals)) if cell_overlap_vals.size else 0.0
+                    centroid_in = _centroid_inside_mask(cell_mask, centroid_pix)
+
+                    try:
+                        surface_dist_um = float(tree.query(centroid_phys_zyx, k=1)[0])
+                    except Exception:
+                        surface_dist_um = np.nan
+
+                    inside_flag = bool(centroid_in or (overlap_frac >= overlap_thr))
+                    near_surface_flag = bool(np.isfinite(surface_dist_um) and (surface_dist_um <= shell_um))
+                    keep_flag = bool(inside_flag or near_surface_flag)
+                    display_flag = bool(keep_flag and pixel_count >= display_min_px)
+
+                    if inside_flag:
+                        classification = "inside_mesh"
+                    elif near_surface_flag:
+                        classification = "surface_shell"
+                    else:
+                        classification = "outside"
+
+                    if keep_flag:
+                        n_total += 1
+                        if inside_flag:
+                            n_inside += 1
+                        else:
+                            n_shell_only += 1
+                        if display_flag:
+                            n_displayed += 1
+
+                        row = {
+                            "channel": channel_name,
+                            "role": _channel_role_name(channel_name),
+                            "puncta_id": int(puncta_id),
+                            "pixel_count": int(pixel_count),
+                            "mean_intensity": int(mean_intensity),
+                            "max_intensity": int(max_intensity),
+                            "centroid_z_um": _round_int(centroid_phys_zyx[0]),
+                            "centroid_y_um": _round_int(centroid_phys_zyx[1]),
+                            "centroid_x_um": _round_int(centroid_phys_zyx[2]),
+                            "centroid_inside_cell_flag": bool(centroid_in),
+                            "overlap_fraction_in_cell_pct": _round_int(overlap_frac * 100.0),
+                            "surface_distance_um": "" if not np.isfinite(surface_dist_um) else _round_int(surface_dist_um),
+                            "inside_mesh_flag": bool(inside_flag),
+                            "within_surface_threshold_flag": bool(near_surface_flag),
+                            "display_threshold_pass_flag": bool(pixel_count >= display_min_px),
+                            "classification": classification,
+                            "_centroid_pix_zyx": np.asarray(centroid_pix, dtype=np.float32),
+                            "_centroid_phys_zyx_um": np.asarray(centroid_phys_zyx, dtype=np.float32),
+                        }
+
+                        if store_coords:
+                            row["_bbox_zyx"] = _bbox_from_coords(global_coords)
+                            row["_coords_global"] = np.asarray(global_coords, dtype=np.int32)
+                            row["_coords_set"] = set(map(tuple, np.asarray(global_coords, dtype=np.int32)))
+
+                        rows.append(row)
+                        all_points.append(centroid_pix)
+                        if display_flag:
+                            displayed_points.append(centroid_pix)
+
+                    del local_mask, local_coords, crop_coords, global_coords, cell_overlap_vals, intens_vals
+
+                if add_layers:
+                    _upsert_points_layer(
+                        displayed_layer_name,
+                        displayed_points,
+                        face_color="cyan",
+                        size=6,
+                        visible=True
+                    )
+                    _upsert_points_layer(
+                        all_layer_name,
+                        all_points,
+                        face_color="yellow",
+                        size=5,
+                        visible=False
+                    )
+
+                del binary_crop, cell_crop, vol_crop, lbl, objs
+                gc.collect()
+
+                return {
+                    "channel": channel_name,
+                    "rows": rows,
+                    "summary": {
+                        "total": int(n_total),
+                        "inside": int(n_inside),
+                        "shell_only": int(n_shell_only),
+                        "displayed": int(n_displayed),
+                    }
+                }
+
+            def _clear_analysis_cache():
+                st["analysis_cache"] = {}
+                gc.collect()
+
+            def _remove_named_layer(layer_name, store_key=None):
+                lyr = None
+
+                if store_key is not None:
+                    try:
+                        lyr = st.get(store_key, {}).pop(layer_name, None)
+                    except Exception:
+                        lyr = None
+
+                if lyr is None:
+                    try:
+                        lyr = pc.layers[layer_name]
+                    except Exception:
+                        lyr = None
+
+                if lyr is not None:
+                    try:
+                        pc.layers.remove(lyr)
+                    except Exception:
+                        pass
+
+            def _upsert_points_layer(layer_name, points_pix, face_color="yellow", edge_color="black", size=6, visible=True):
+                pts = np.asarray(points_pix, dtype=np.float32)
+                if pts.size == 0:
+                    pts = np.zeros((0, 3), dtype=np.float32)
+
+                existing = st["point_layers"].get(layer_name, None)
+
+                def _style_points_layer(lyr):
+                    try:
+                        lyr.scale = _current_spacing()
+                    except Exception:
+                        pass
+                    try:
+                        lyr.face_color = face_color
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(lyr, "border_color"):
+                            lyr.border_color = edge_color
+                        elif hasattr(lyr, "edge_color"):
+                            lyr.edge_color = edge_color
+                    except Exception:
+                        pass
+                    try:
+                        lyr.size = size
+                    except Exception:
+                        pass
+                    try:
+                        lyr.visible = visible
+                    except Exception:
+                        pass
+
+                if existing is None:
+                    lyr = pc.add_points(
+                        pts,
+                        name=layer_name,
+                        ndim=3,
+                        scale=_current_spacing(),
+                        face_color=face_color,
+                        size=size,
+                        visible=visible,
+                    )
+                    _style_points_layer(lyr)
+                    st["point_layers"][layer_name] = lyr
+                    return lyr
+
+                try:
+                    existing.data = pts
+                    _style_points_layer(existing)
+                    return existing
+                except Exception:
+                    try:
+                        pc.layers.remove(existing)
+                    except Exception:
+                        pass
+
+                    lyr = pc.add_points(
+                        pts,
+                        name=layer_name,
+                        ndim=3,
+                        scale=_current_spacing(),
+                        face_color=face_color,
+                        size=size,
+                        visible=visible,
+                    )
+                    _style_points_layer(lyr)
+                    st["point_layers"][layer_name] = lyr
+                    return lyr
+
+
+            def _restrict_selected_puncta():
+                selected = _get_selected_protein_channels()
+                if not selected:
+                    QMessageBox.warning(self, "Restrict puncta", "Select at least one protein channel.")
+                    return
+
+                if st.get("cell_mask", None) is None:
+                    QMessageBox.warning(self, "Restrict puncta", "No cell-of-interest mesh is available.")
+                    return
+
+                for ch in st.get("protein_channels", []):
+                    _remove_named_layer(f"Displayed puncta centroids - {ch}", "point_layers")
+                    _remove_named_layer(f"All puncta centroids - {ch}", "point_layers")
+
+                summaries = []
+                cache = {}
+
+                total = len(selected)
+                for i, ch in enumerate(selected, start=1):
+                    _update_status(f"Restricting {ch} ({i}/{total})...")
+                    QApplication.processEvents()
+
+                    try:
+                        res = _analyze_puncta_channel(ch, store_coords=False, add_layers=True)
+                        cache[ch] = {
+                            "rows": res["rows"],
+                            "summary": res["summary"],
+                            "coords_stored": False,
+                        }
+                        s = res["summary"]
+                        summaries.append(
+                            f"{ch}: kept={s['total']}, inside={s['inside']}, shell_only={s['shell_only']}, displayed={s['displayed']}"
+                        )
+                    except Exception as e:
+                        summaries.append(f"{ch}: failed ({e})")
+
+                    QApplication.processEvents()
+
+                st["analysis_cache"] = cache
+                _sync_localization_combos()
+                _update_status("Restriction complete")
+
+                QMessageBox.information(
+                    self,
+                    "Restrict puncta",
+                    "Restriction complete.\n\n" + "\n".join(summaries)
+                )
+
+
+            def _prompt_export_threshold_choice():
+                reply = QMessageBox.question(
+                    self,
+                    "Export puncta CSV",
+                    "Include puncta below the visualization pixel threshold in the CSV?\n\n"
+                    "Yes = include all kept puncta.\n"
+                    "No = exclude puncta below the current display min pixel count.\n"
+                    "Cancel = do not export.",
+                    QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                    QMessageBox.Yes,
+                )
+                if reply == QMessageBox.Cancel:
+                    return None
+                return bool(reply == QMessageBox.Yes)
+
+            def _export_puncta_csv():
+                selected = _get_selected_protein_channels()
+                if not selected:
+                    QMessageBox.warning(self, "Export puncta CSV", "Select at least one protein channel.")
+                    return
+
+                if st.get("cell_mask", None) is None:
+                    QMessageBox.warning(self, "Export puncta CSV", "No cell-of-interest mesh is available.")
+                    return
+
+                include_below_threshold = _prompt_export_threshold_choice()
+                if include_below_threshold is None:
+                    return
+
+                default_name = f"{_safe_stem(str(st.get('cell_channel_name', 'puncta')))}_puncta_measurements.csv"
+                save_path, _ = QFileDialog.getSaveFileName(
+                    self,
+                    "Save puncta CSV",
+                    default_name,
+                    "CSV files (*.csv)"
+                )
+                if not save_path:
+                    return
+                if not str(save_path).lower().endswith(".csv"):
+                    save_path = str(save_path) + ".csv"
+
+                fieldnames = [
+                    "cell_channel",
+                    "protein_role",
+                    "puncta_channel",
+                    "puncta_id",
+                    "pixel_count",
+                    "mean_intensity",
+                    "max_intensity",
+                    "centroid_x_um",
+                    "centroid_y_um",
+                    "centroid_z_um",
+                    "centroid_inside_cell_flag",
+                    "overlap_fraction_in_cell_pct",
+                    "surface_distance_um",
+                    "inside_mesh_flag",
+                    "within_surface_threshold_flag",
+                    "display_threshold_pass_flag",
+                    "classification",
+                ]
+
+                summary_lines = []
+                cache = {}
+                pixel_filter = int(display_min_pixels.value())
+
+                try:
+                    with open(save_path, "w", newline="", encoding="utf-8") as f:
+                        writer = csv.DictWriter(f, fieldnames=fieldnames)
+                        writer.writeheader()
+
+                        for ch in selected:
+                            res = _analyze_puncta_channel(ch, store_coords=False, add_layers=False)
+                            cache[ch] = {
+                                "rows": res["rows"],
+                                "summary": res["summary"],
+                                "coords_stored": False,
+                            }
+
+                            exported = 0
+                            inside = 0
+                            shell_only = 0
+
+                            for r in res["rows"]:
+                                if (not include_below_threshold) and (int(r["pixel_count"]) < pixel_filter):
+                                    continue
+
+                                writer.writerow({
+                                    "cell_channel": str(st.get("cell_channel_name", "")),
+                                    "protein_role": str(r["role"]),
+                                    "puncta_channel": str(r["channel"]),
+                                    "puncta_id": int(r["puncta_id"]),
+                                    "pixel_count": int(r["pixel_count"]),
+                                    "mean_intensity": int(r["mean_intensity"]),
+                                    "max_intensity": int(r["max_intensity"]),
+                                    "centroid_x_um": int(r["centroid_x_um"]),
+                                    "centroid_y_um": int(r["centroid_y_um"]),
+                                    "centroid_z_um": int(r["centroid_z_um"]),
+                                    "centroid_inside_cell_flag": bool(r["centroid_inside_cell_flag"]),
+                                    "overlap_fraction_in_cell_pct": int(r["overlap_fraction_in_cell_pct"]),
+                                    "surface_distance_um": r["surface_distance_um"],
+                                    "inside_mesh_flag": bool(r["inside_mesh_flag"]),
+                                    "within_surface_threshold_flag": bool(r["within_surface_threshold_flag"]),
+                                    "display_threshold_pass_flag": bool(r["display_threshold_pass_flag"]),
+                                    "classification": str(r["classification"]),
+                                })
+
+                                exported += 1
+                                if bool(r["inside_mesh_flag"]):
+                                    inside += 1
+                                elif bool(r["within_surface_threshold_flag"]):
+                                    shell_only += 1
+
+                            summary_lines.append(
+                                f"{ch}: exported={exported}, inside={inside}, shell_only={shell_only}"
+                            )
+
+                    st["analysis_cache"] = cache
+                    QMessageBox.information(
+                        self,
+                        "Export puncta CSV",
+                        f"Saved puncta CSV to:\n{save_path}\n\n" + "\n".join(summary_lines)
+                    )
+                    _update_status(f"Saved puncta CSV: {save_path}")
+                except Exception as e:
+                    QMessageBox.critical(self, "Export puncta CSV", f"Failed to save CSV:\n{e}")
+                    return
+
+            def _ensure_analysis_for_channel(channel_name, store_coords=False):
+                cache = st.get("analysis_cache", {})
+                cached = cache.get(channel_name, None)
+
+                if cached is not None:
+                    if store_coords and not cached.get("coords_stored", False):
+                        res = _analyze_puncta_channel(channel_name, store_coords=True, add_layers=False)
+                        cache[channel_name] = {
+                            "rows": res["rows"],
+                            "summary": res["summary"],
+                            "coords_stored": True,
+                        }
+                        st["analysis_cache"] = cache
+                        return cache[channel_name]
+                    return cached
+
+                res = _analyze_puncta_channel(channel_name, store_coords=store_coords, add_layers=False)
+                cache[channel_name] = {
+                    "rows": res["rows"],
+                    "summary": res["summary"],
+                    "coords_stored": bool(store_coords),
+                }
+                st["analysis_cache"] = cache
+                return cache[channel_name]
+
+            def _localize_selected_channels():
+                ch_a = str(loc_ch_a.currentText())
+                ch_b = str(loc_ch_b.currentText())
+
+                if not ch_a or not ch_b:
+                    QMessageBox.warning(self, "Localization", "Select two protein channels.")
+                    return
+                if ch_a == ch_b:
+                    QMessageBox.warning(self, "Localization", "Choose two different channels.")
+                    return
+                if st.get("cell_mask", None) is None:
+                    QMessageBox.warning(self, "Localization", "No cell-of-interest mesh is available.")
+                    return
+
+                mode = str(loc_mode.currentText())
+                need_coords = (not mode.startswith("Centroid"))
+
+                try:
+                    data_a = _ensure_analysis_for_channel(ch_a, store_coords=need_coords)
+                    data_b = _ensure_analysis_for_channel(ch_b, store_coords=need_coords)
+                except Exception as e:
+                    QMessageBox.critical(self, "Localization", f"Failed during puncta analysis:\n{e}")
+                    return
+
+                rows_a = list(data_a["rows"])
+                rows_b = list(data_b["rows"])
+
+                if not rows_a or not rows_b:
+                    QMessageBox.information(self, "Localization", "One or both channels have no puncta.")
+                    return
+
+                matched_rows = []
+
+                if mode.startswith("Centroid"):
+                    tol = float(loc_centroid_tol_um.value())
+
+                    pts_b = np.array([r["_centroid_phys_zyx_um"] for r in rows_b], dtype=np.float32)
+                    tree_b = cKDTree(pts_b)
+
+                    candidates = []
+                    for ia, ra in enumerate(rows_a):
+                        center_a = np.asarray(ra["_centroid_phys_zyx_um"], dtype=np.float32)
+                        idxs = tree_b.query_ball_point(center_a, r=tol)
+                        for ib in idxs:
+                            rb = rows_b[int(ib)]
+                            d = float(np.linalg.norm(center_a - np.asarray(rb["_centroid_phys_zyx_um"], dtype=np.float32)))
+                            candidates.append((d, ia, int(ib)))
+
+                    candidates.sort(key=lambda x: x[0])
+                    used_a = set()
+                    used_b = set()
+
+                    for dist_um, ia, ib in candidates:
+                        if ia in used_a or ib in used_b:
+                            continue
+                        used_a.add(ia)
+                        used_b.add(ib)
+
+                        ra = rows_a[ia]
+                        rb = rows_b[ib]
+
+                        matched_rows.append({
+                            "channel_a": ch_a,
+                            "channel_b": ch_b,
+                            "puncta_id_a": int(ra["puncta_id"]),
+                            "puncta_id_b": int(rb["puncta_id"]),
+                            "match_mode": "centroid_distance",
+                            "centroid_distance_um": _round_int(dist_um),
+                            "voxel_overlap_fraction_min_object_pct": "",
+                            "pixel_count_a": int(ra["pixel_count"]),
+                            "pixel_count_b": int(rb["pixel_count"]),
+                            "mean_intensity_a": int(ra.get("mean_intensity", 0)),
+                            "max_intensity_a": int(ra.get("max_intensity", 0)),
+                            "mean_intensity_b": int(rb.get("mean_intensity", 0)),
+                            "max_intensity_b": int(rb.get("max_intensity", 0)),
+                            "centroid_x_a_um": int(ra["centroid_x_um"]),
+                            "centroid_y_a_um": int(ra["centroid_y_um"]),
+                            "centroid_z_a_um": int(ra["centroid_z_um"]),
+                            "centroid_x_b_um": int(rb["centroid_x_um"]),
+                            "centroid_y_b_um": int(rb["centroid_y_um"]),
+                            "centroid_z_b_um": int(rb["centroid_z_um"]),
+                            "inside_mesh_flag_a": bool(ra["inside_mesh_flag"]),
+                            "inside_mesh_flag_b": bool(rb["inside_mesh_flag"]),
+                            "within_surface_threshold_flag_a": bool(ra["within_surface_threshold_flag"]),
+                            "within_surface_threshold_flag_b": bool(rb["within_surface_threshold_flag"]),
+                        })
+
+                    del pts_b, tree_b, candidates
+
+                else:
+                    overlap_thr = float(loc_voxel_overlap_pct.value()) / 100.0
+                    candidates = []
+
+                    for ia, ra in enumerate(rows_a):
+                        bbox_a = ra["_bbox_zyx"]
+                        set_a = ra["_coords_set"]
+                        len_a = max(1, len(set_a))
+
+                        for ib, rb in enumerate(rows_b):
+                            bbox_b = rb["_bbox_zyx"]
+                            if not _bboxes_intersect(bbox_a, bbox_b):
+                                continue
+
+                            set_b = rb["_coords_set"]
+                            len_b = max(1, len(set_b))
+                            inter = int(len(set_a.intersection(set_b)))
+                            if inter <= 0:
+                                continue
+
+                            frac = float(inter) / float(min(len_a, len_b))
+                            if frac >= overlap_thr:
+                                candidates.append((frac, ia, ib))
+
+                    candidates.sort(key=lambda x: x[0], reverse=True)
+                    used_a = set()
+                    used_b = set()
+
+                    for frac, ia, ib in candidates:
+                        if ia in used_a or ib in used_b:
+                            continue
+                        used_a.add(ia)
+                        used_b.add(ib)
+
+                        ra = rows_a[ia]
+                        rb = rows_b[ib]
+                        center_a = np.asarray(ra["_centroid_phys_zyx_um"], dtype=np.float32)
+                        center_b = np.asarray(rb["_centroid_phys_zyx_um"], dtype=np.float32)
+                        dist_um = float(np.linalg.norm(center_a - center_b))
+
+                        matched_rows.append({
+                            "channel_a": ch_a,
+                            "channel_b": ch_b,
+                            "puncta_id_a": int(ra["puncta_id"]),
+                            "puncta_id_b": int(rb["puncta_id"]),
+                            "match_mode": "voxel_overlap",
+                            "centroid_distance_um": _round_int(dist_um),
+                            "voxel_overlap_fraction_min_object_pct": _round_int(frac * 100.0),
+                            "pixel_count_a": int(ra["pixel_count"]),
+                            "pixel_count_b": int(rb["pixel_count"]),
+                            "mean_intensity_a": int(ra.get("mean_intensity", 0)),
+                            "max_intensity_a": int(ra.get("max_intensity", 0)),
+                            "mean_intensity_b": int(rb.get("mean_intensity", 0)),
+                            "max_intensity_b": int(rb.get("max_intensity", 0)),
+                            "centroid_x_a_um": int(ra["centroid_x_um"]),
+                            "centroid_y_a_um": int(ra["centroid_y_um"]),
+                            "centroid_z_a_um": int(ra["centroid_z_um"]),
+                            "centroid_x_b_um": int(rb["centroid_x_um"]),
+                            "centroid_y_b_um": int(rb["centroid_y_um"]),
+                            "centroid_z_b_um": int(rb["centroid_z_um"]),
+                            "inside_mesh_flag_a": bool(ra["inside_mesh_flag"]),
+                            "inside_mesh_flag_b": bool(rb["inside_mesh_flag"]),
+                            "within_surface_threshold_flag_a": bool(ra["within_surface_threshold_flag"]),
+                            "within_surface_threshold_flag_b": bool(rb["within_surface_threshold_flag"]),
+                        })
+
+                    del candidates
+
+                if not matched_rows:
+                    old_layer_name = f"Localized puncta pairs - {ch_a} vs {ch_b}"
+                    try:
+                        lyr = st.get("point_layers", {}).pop(old_layer_name, None)
+                        if lyr is not None:
+                            pc.layers.remove(lyr)
+                    except Exception:
+                        pass
+
+                    QMessageBox.information(self, "Localization", "No localized puncta matches were found.")
+                    return
+
+                save_name = f"{_safe_stem(ch_a)}_vs_{_safe_stem(ch_b)}_localization.csv"
+                save_path, _ = QFileDialog.getSaveFileName(
+                    self,
+                    "Save localization CSV",
+                    save_name,
+                    "CSV files (*.csv)"
+                )
+                if not save_path:
+                    return
+                if not str(save_path).lower().endswith(".csv"):
+                    save_path = str(save_path) + ".csv"
+
+                csv_saved = False
+
+                try:
+                    with open(save_path, "w", newline="", encoding="utf-8") as f:
+                        fieldnames = list(matched_rows[0].keys())
+                        writer = csv.DictWriter(f, fieldnames=fieldnames)
+                        writer.writeheader()
+                        writer.writerows(matched_rows)
+                    csv_saved = True
+                except Exception as e:
+                    QMessageBox.critical(
+                        self,
+                        "Localization",
+                        f"Failed to save localization CSV:\n{e}"
+                    )
+                    return
+
+                try:
+                    rows_a_by_id = {int(r["puncta_id"]): r for r in rows_a}
+                    rows_b_by_id = {int(r["puncta_id"]): r for r in rows_b}
+
+                    pts_pix = []
+                    for m in matched_rows:
+                        ra = rows_a_by_id.get(int(m["puncta_id_a"]))
+                        rb = rows_b_by_id.get(int(m["puncta_id_b"]))
+                        if ra is None or rb is None:
+                            continue
+
+                        za = np.asarray(ra["_centroid_pix_zyx"], dtype=np.float32)
+                        zb = np.asarray(rb["_centroid_pix_zyx"], dtype=np.float32)
+                        pts_pix.append((za + zb) / 2.0)
+
+                    layer_name = f"Localized puncta pairs - {ch_a} vs {ch_b}"
+
+                    try:
+                        old_lyr = st.get("point_layers", {}).pop(layer_name, None)
+                        if old_lyr is not None:
+                            pc.layers.remove(old_lyr)
+                    except Exception:
+                        pass
+
+                    _upsert_points_layer(
+                        layer_name,
+                        pts_pix,
+                        face_color="white",
+                        size=7,
+                        visible=True
+                    )
+
+                except Exception as e:
+                    QMessageBox.warning(
+                        self,
+                        "Localization",
+                        f"Localization CSV was saved, but the viewer points could not be updated:\n{e}"
+                    )
+                    _update_status(f"Saved localization CSV: {save_path}")
+                    gc.collect()
+                    return
+
+                QMessageBox.information(
+                    self,
+                    "Localization",
+                    f"Saved localization CSV to:\n{save_path}\n\n"
+                    f"Matched pairs: {len(matched_rows)}"
+                )
+                _update_status(f"Saved localization CSV: {save_path}")
+                gc.collect()
+
+
+
+            # ============================================================
+            # Dock UI
+            # ============================================================
+            container = QWidget()
+            layout = QVBoxLayout(container)
+            layout.setContentsMargins(6, 6, 6, 6)
+            layout.setSpacing(6)
+
+            status_label = QLabel("Ready")
+            layout.addWidget(status_label)
+
+            assigned_lines = []
+            for role in ordered_roles:
+                if role in accepted_roles:
+                    assigned_lines.append(f"{role}: {accepted_roles[role]['channel']}")
+                else:
+                    assigned_lines.append(f"{role}: None")
+
+            assigned_group = QGroupBox("Assigned roles")
+            assigned_layout = QVBoxLayout(assigned_group)
+            for line in assigned_lines:
+                assigned_layout.addWidget(QLabel(line))
+            layout.addWidget(assigned_group)
+
+            voxel_group = QGroupBox("Voxel size (Z, Y, X) µm")
+            voxel_layout = QHBoxLayout(voxel_group)
+
+            z_spacing = QDoubleSpinBox()
+            z_spacing.setDecimals(4)
+            z_spacing.setRange(1e-6, 1e9)
+            z_spacing.setValue(float(spacing0[0]))
+            voxel_layout.addWidget(QLabel("Z"))
+            voxel_layout.addWidget(z_spacing)
+
+            y_spacing = QDoubleSpinBox()
+            y_spacing.setDecimals(4)
+            y_spacing.setRange(1e-6, 1e9)
+            y_spacing.setValue(float(spacing0[1]))
+            voxel_layout.addWidget(QLabel("Y"))
+            voxel_layout.addWidget(y_spacing)
+
+            x_spacing = QDoubleSpinBox()
+            x_spacing.setDecimals(4)
+            x_spacing.setRange(1e-6, 1e9)
+            x_spacing.setValue(float(spacing0[2]))
+            voxel_layout.addWidget(QLabel("X"))
+            voxel_layout.addWidget(x_spacing)
+
+            layout.addWidget(voxel_group)
+
+            def _apply_spacing_from_widgets():
+                sp = (
+                    float(z_spacing.value()),
+                    float(y_spacing.value()),
+                    float(x_spacing.value()),
+                )
+                _set_spacing(sp)
+                _update_status(f"Voxel size updated to {sp}")
+
+            z_spacing.valueChanged.connect(lambda _=None: _apply_spacing_from_widgets())
+            y_spacing.valueChanged.connect(lambda _=None: _apply_spacing_from_widgets())
+            x_spacing.valueChanged.connect(lambda _=None: _apply_spacing_from_widgets())
+
+            # ------------------------------------------------------------
+            # Cell export
+            # ------------------------------------------------------------
+            cell_export_group = QGroupBox("Cell-of-interest export")
+            cell_export_layout = QVBoxLayout(cell_export_group)
+
+            save_cell_meta_btn = QPushButton("Save meta data from cell of interest")
+            export_cell_obj_btn = QPushButton("Export cell of interest OBJ + JSON")
+
+            cell_export_layout.addWidget(save_cell_meta_btn)
+            cell_export_layout.addWidget(export_cell_obj_btn)
+            layout.addWidget(cell_export_group)
+
+            # ------------------------------------------------------------
+            # Protein channels for analysis
+            # ------------------------------------------------------------
+            protein_group = QGroupBox("Protein channels for analysis")
+            protein_layout = QVBoxLayout(protein_group)
+
+            protein_channel_list = QListWidget()
+            protein_channel_list.setSelectionMode(QAbstractItemView.NoSelection)
+
+            for role in ["Protein 1", "Protein 2", "Protein 3"]:
+                if role not in accepted_roles:
+                    continue
+                ch = accepted_roles[role]["channel"]
+                it = QListWidgetItem(f"{role} | {ch}")
+                it.setData(Qt.UserRole, ch)
+                it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+                it.setCheckState(Qt.Checked)
+                protein_channel_list.addItem(it)
+
+            protein_layout.addWidget(protein_channel_list)
+            layout.addWidget(protein_group)
+
+            # ------------------------------------------------------------
+            # Restriction / display
+            # ------------------------------------------------------------
+            restrict_group = QGroupBox("Puncta restriction / display")
+            restrict_layout = QVBoxLayout(restrict_group)
+
+            puncta_thr_row = QHBoxLayout()
+            puncta_thr_row.addWidget(QLabel("Puncta voxel threshold (> value)"))
+            puncta_voxel_threshold = QDoubleSpinBox()
+            puncta_voxel_threshold.setDecimals(0)
+            puncta_voxel_threshold.setRange(0, 10**12)
+            puncta_voxel_threshold.setValue(0)
+            puncta_thr_row.addWidget(puncta_voxel_threshold)
+            restrict_layout.addLayout(puncta_thr_row)
+
+            inside_row = QHBoxLayout()
+            inside_row.addWidget(QLabel("Inside if overlap fraction >= (%)"))
+            inside_frac = QDoubleSpinBox()
+            inside_frac.setDecimals(0)
+            inside_frac.setRange(0, 100)
+            inside_frac.setValue(90)
+            inside_row.addWidget(inside_frac)
+            restrict_layout.addLayout(inside_row)
+
+            shell_row = QHBoxLayout()
+            shell_row.addWidget(QLabel("Surface shell threshold (µm)"))
+            surface_shell_um = QDoubleSpinBox()
+            surface_shell_um.setDecimals(1)
+            surface_shell_um.setRange(0, 10**6)
+            surface_shell_um.setValue(1)
+            shell_row.addWidget(surface_shell_um)
+            restrict_layout.addLayout(shell_row)
+
+            display_row = QHBoxLayout()
+            display_row.addWidget(QLabel("Display min pixel count (visualization only)"))
+            display_min_pixels = QSpinBox()
+            display_min_pixels.setRange(0, 10**9)
+            display_min_pixels.setValue(0)
+            display_row.addWidget(display_min_pixels)
+            restrict_layout.addLayout(display_row)
+
+            restrict_btn = QPushButton("Restrict selected puncta channels to cell / surface shell")
+            restrict_layout.addWidget(restrict_btn)
+
+            layout.addWidget(restrict_group)
+
+            # ------------------------------------------------------------
+            # CSV export
+            # ------------------------------------------------------------
+            export_group = QGroupBox("Puncta export")
+            export_layout = QVBoxLayout(export_group)
+
+            export_btn = QPushButton("Count puncta + export CSV")
+            export_layout.addWidget(export_btn)
+
+            layout.addWidget(export_group)
+
+            # ------------------------------------------------------------
+            # Localization
+            # ------------------------------------------------------------
+            loc_group = QGroupBox("Protein-channel localization")
+            loc_layout = QVBoxLayout(loc_group)
+
+            loc_row_a = QHBoxLayout()
+            loc_row_a.addWidget(QLabel("Channel A"))
+            loc_ch_a = QComboBox()
+            loc_row_a.addWidget(loc_ch_a)
+            loc_layout.addLayout(loc_row_a)
+
+            loc_row_b = QHBoxLayout()
+            loc_row_b.addWidget(QLabel("Channel B"))
+            loc_ch_b = QComboBox()
+            loc_row_b.addWidget(loc_ch_b)
+            loc_layout.addLayout(loc_row_b)
+
+            loc_mode_row = QHBoxLayout()
+            loc_mode_row.addWidget(QLabel("Localization mode"))
+            loc_mode = QComboBox()
+            loc_mode.addItems([
+                "Centroid distance threshold",
+                "Voxel overlap threshold",
+            ])
+            loc_mode_row.addWidget(loc_mode)
+            loc_layout.addLayout(loc_mode_row)
+
+            loc_tol_row = QHBoxLayout()
+            loc_tol_row.addWidget(QLabel("Centroid tolerance (µm)"))
+            loc_centroid_tol_um = QDoubleSpinBox()
+            loc_centroid_tol_um.setDecimals(1)
+            loc_centroid_tol_um.setRange(0, 10**6)
+            loc_centroid_tol_um.setValue(1)
+            loc_tol_row.addWidget(loc_centroid_tol_um)
+            loc_layout.addLayout(loc_tol_row)
+
+            loc_overlap_row = QHBoxLayout()
+            loc_overlap_row.addWidget(QLabel("Voxel overlap threshold (%)"))
+            loc_voxel_overlap_pct = QDoubleSpinBox()
+            loc_voxel_overlap_pct.setDecimals(0)
+            loc_voxel_overlap_pct.setRange(0, 100)
+            loc_voxel_overlap_pct.setValue(90)
+            loc_overlap_row.addWidget(loc_voxel_overlap_pct)
+            loc_layout.addLayout(loc_overlap_row)
+
+            localize_btn = QPushButton("Analyze localization + export CSV")
+            loc_layout.addWidget(localize_btn)
+
+            layout.addWidget(loc_group)
+
+            # ------------------------------------------------------------
+            # Utilities
+            # ------------------------------------------------------------
+            util_group = QGroupBox("Utilities")
+            util_layout = QVBoxLayout(util_group)
+
+            clear_cache_btn = QPushButton("Clear analysis cache")
+            screenshot_btn = QPushButton("Save screenshot")
+
+            util_layout.addWidget(clear_cache_btn)
+            util_layout.addWidget(screenshot_btn)
+            layout.addWidget(util_group)
+
+            layout.addStretch(1)
+            container.setLayout(layout)
+
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(container)
+            pc.window.add_dock_widget(scroll, area="right")
+
+            # ============================================================
+            # Signal wiring
+            # ============================================================
+            save_cell_meta_btn.clicked.connect(lambda _=False: _save_cell_metadata_dialog())
+            export_cell_obj_btn.clicked.connect(lambda _=False: _export_cell_mesh_obj())
+            restrict_btn.clicked.connect(lambda _=False: _restrict_selected_puncta())
+            export_btn.clicked.connect(lambda _=False: _export_puncta_csv())
+            localize_btn.clicked.connect(lambda _=False: _localize_selected_channels())
+            clear_cache_btn.clicked.connect(lambda _=False: _clear_analysis_cache())
+            screenshot_btn.clicked.connect(
+                lambda _=False: self.save_screenshot(
+                    viewer=pc,
+                    parent=self,
+                    default_name="puncta_counter.png",
+                    canvas_only=True,
+                )
+            )
+
+            protein_channel_list.itemChanged.connect(lambda *_: _sync_localization_combos())
+            loc_mode.currentIndexChanged.connect(lambda _=None: _sync_loc_mode_widgets())
+
+            # ============================================================
+            # Initial state sync
+            # ============================================================
+            _sync_localization_combos()
+            _sync_loc_mode_widgets()
+            _apply_spacing_from_widgets()
+
+            summary_lines = []
+            for role in ordered_roles:
+                if role in accepted_roles:
+                    summary_lines.append(f"{role}: {accepted_roles[role]['channel']}")
+                else:
+                    summary_lines.append(f"{role}: None / N/A")
+
+            QMessageBox.information(
+                self,
+                "Puncta Counter",
+                "Puncta counter opened.\n\n"
+                f"Voxel size (Z, Y, X): {tuple(float(x) for x in spacing0)}\n\n"
+                "Accepted channels:\n"
+                + "\n".join(summary_lines)
+                + "\n\nSuggested workflow:\n"
+                "1. Inspect accepted surfaces in the 3D viewer.\n"
+                "2. Select protein channels to analyze.\n"
+                "3. Set puncta threshold, overlap %, shell distance, and display minimum.\n"
+                "4. Run restriction first to preview centroid layers.\n"
+                "5. Export puncta CSV.\n"
+                "6. Run localization export if needed."
+            )
+
+            return
+
+        except Exception as e:
+            try:
+                QMessageBox.critical(self, "Error", f"Failed to open puncta counter:\n{e}")
+            except Exception:
+                pass
+            traceback.print_exc()
+
     def _cell_counter_resolve_infer_weights(self, model_path: str = "") -> str:
         """
         Returns a string to pass to CellposeModel(pretrained_model=...).
@@ -3872,8 +6239,6 @@ class UIWidget(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Intensity export failed:\n{e}")
 
-
-
     def open_preprocess(self):
         self_parent = self
         dlg = QDialog(self)
@@ -3894,6 +6259,478 @@ class UIWidget(QWidget):
                 )
             else:
                 self_parent.z_range_label.setText(f"Z: {self_parent.current_z}   (range 0–{end})")
+
+        def open_crop_projection_viewer(
+                self,
+                image_layer_names=None,
+                fill_value=0,
+                tight_bbox=True,
+                visible_only=True,
+            ):
+            import numpy as np
+            import napari
+            from napari.layers import Image
+            from qtpy.QtCore import QTimer
+            from qtpy.QtWidgets import (
+                QWidget,
+                QVBoxLayout,
+                QPushButton,
+                QLabel,
+                QMessageBox,
+            )
+            from skimage.draw import polygon2mask
+
+            main_viewer = self.viewer
+
+            def _qt_parent():
+                try:
+                    return main_viewer.window._qt_window
+                except Exception:
+                    return None
+
+            def _normalize_names(names):
+                if names is None:
+                    return None
+                if isinstance(names, str):
+                    return [names]
+                return [str(x) for x in names]
+
+            def _as_nd_tuple(value, ndim, default):
+                if value is None:
+                    return (default,) * ndim
+                try:
+                    if np.isscalar(value):
+                        return (value,) * ndim
+                except Exception:
+                    pass
+                try:
+                    seq = tuple(value)
+                except Exception:
+                    return (default,) * ndim
+                if len(seq) == 0:
+                    return (default,) * ndim
+                if len(seq) >= ndim:
+                    return tuple(seq[-ndim:])
+                return (default,) * (ndim - len(seq)) + tuple(seq)
+
+            def _allclose(a, b, atol=1e-9, rtol=1e-7):
+                try:
+                    return np.allclose(np.asarray(a, dtype=float), np.asarray(b, dtype=float), atol=atol, rtol=rtol)
+                except Exception:
+                    return False
+
+            def _rotation_is_identity(rot):
+                if rot is None:
+                    return True
+                r = np.asarray(rot, dtype=float)
+                if r.size == 0:
+                    return True
+                if r.ndim == 0:
+                    return np.allclose(float(r), 0.0)
+                if r.ndim == 1:
+                    return np.allclose(r, 0.0)
+                if r.ndim == 2 and r.shape[0] == r.shape[1]:
+                    return np.allclose(r, np.eye(r.shape[0]), atol=1e-9, rtol=1e-7)
+                return False
+
+            def _shear_is_identity(shear):
+                if shear is None:
+                    return True
+                s = np.asarray(shear, dtype=float)
+                if s.size == 0:
+                    return True
+                if s.ndim <= 1:
+                    return np.allclose(s, 0.0)
+                if s.ndim == 2 and s.shape[0] == s.shape[1]:
+                    return np.allclose(s, np.eye(s.shape[0]), atol=1e-9, rtol=1e-7)
+                return False
+
+            def _affine_is_identity(layer):
+                aff = getattr(layer, "affine", None)
+                if aff is None:
+                    return True
+
+                try:
+                    linear = getattr(aff, "linear_matrix", None)
+                except Exception:
+                    linear = None
+
+                try:
+                    extra_translate = getattr(aff, "translate", None)
+                except Exception:
+                    extra_translate = None
+
+                if linear is not None:
+                    lin = np.asarray(linear, dtype=float)
+                    if lin.size:
+                        if lin.ndim != 2 or lin.shape[0] != lin.shape[1]:
+                            return False
+                        if not np.allclose(lin, np.eye(lin.shape[0]), atol=1e-9, rtol=1e-7):
+                            return False
+
+                if extra_translate is not None:
+                    tr = np.asarray(extra_translate, dtype=float)
+                    if tr.size and not np.allclose(tr, 0.0, atol=1e-9, rtol=1e-7):
+                        return False
+
+                return True
+
+            def _has_unsupported_transform(layer):
+                try:
+                    if not _rotation_is_identity(getattr(layer, "rotate", None)):
+                        return True, "rotation"
+                except Exception:
+                    return True, "rotation"
+
+                try:
+                    if not _shear_is_identity(getattr(layer, "shear", None)):
+                        return True, "shear"
+                except Exception:
+                    return True, "shear"
+
+                try:
+                    if not _affine_is_identity(layer):
+                        return True, "non-identity affine"
+                except Exception:
+                    return True, "non-identity affine"
+
+                return False, None
+
+            def _get_image_layers(names=None, visible_only=True):
+                names = _normalize_names(names)
+                all_layers = [lyr for lyr in main_viewer.layers if isinstance(lyr, Image)]
+
+                if names is not None:
+                    found = {lyr.name for lyr in all_layers}
+                    missing = [nm for nm in names if nm not in found]
+                    if missing:
+                        raise ValueError(f"Requested image layer(s) not found: {', '.join(missing)}")
+
+                layers = list(all_layers)
+
+                if visible_only:
+                    layers = [lyr for lyr in layers if getattr(lyr, "visible", True)]
+
+                if names is not None:
+                    wanted = set(names)
+                    layers = [lyr for lyr in layers if lyr.name in wanted]
+                    layers.sort(key=lambda lyr: names.index(lyr.name))
+
+                if not layers:
+                    raise ValueError("No matching Image layers found.")
+
+                return layers
+
+            source_layers = _get_image_layers(image_layer_names, visible_only=visible_only)
+
+            validated_layers = []
+            rejected = []
+
+            ref_yx = None
+            ref_scale_yx = None
+            ref_translate_yx = None
+
+            for lyr in source_layers:
+                try:
+                    if getattr(lyr, "multiscale", False):
+                        rejected.append(f"{lyr.name}: multiscale layers are not supported")
+                        continue
+
+                    if bool(getattr(lyr, "rgb", False)):
+                        rejected.append(f"{lyr.name}: RGB image layers are not supported")
+                        continue
+
+                    arr = np.asarray(lyr.data)
+                    if arr.ndim < 3:
+                        rejected.append(f"{lyr.name}: requires 3D+ data, got shape {arr.shape}")
+                        continue
+
+                    unsupported, reason = _has_unsupported_transform(lyr)
+                    if unsupported:
+                        rejected.append(f"{lyr.name}: unsupported {reason}")
+                        continue
+
+                    yx = tuple(int(v) for v in arr.shape[-2:])
+                    scale = _as_nd_tuple(getattr(lyr, "scale", None), arr.ndim, 1.0)
+                    translate = _as_nd_tuple(getattr(lyr, "translate", None), arr.ndim, 0.0)
+
+                    scale_yx = tuple(float(v) for v in scale[-2:])
+                    translate_yx = tuple(float(v) for v in translate[-2:])
+
+                    if ref_yx is None:
+                        ref_yx = yx
+                        ref_scale_yx = scale_yx
+                        ref_translate_yx = translate_yx
+                    else:
+                        if yx != ref_yx:
+                            rejected.append(f"{lyr.name}: YX shape {yx} does not match reference {ref_yx}")
+                            continue
+                        if not _allclose(scale_yx, ref_scale_yx):
+                            rejected.append(f"{lyr.name}: YX scale {scale_yx} does not match reference {ref_scale_yx}")
+                            continue
+                        if not _allclose(translate_yx, ref_translate_yx):
+                            rejected.append(
+                                f"{lyr.name}: YX translate {translate_yx} does not match reference {ref_translate_yx}"
+                            )
+                            continue
+
+                    validated_layers.append(lyr)
+
+                except Exception as e:
+                    rejected.append(f"{getattr(lyr, 'name', '<unnamed>')}: {e}")
+
+            if not validated_layers:
+                msg = "No compatible 3D+ image layers with shared YX geometry were found."
+                if rejected:
+                    msg += "\n\nRejected layers:\n" + "\n".join(rejected)
+                raise ValueError(msg)
+
+            base_yx = ref_yx
+            proj_scale_yx = tuple(ref_scale_yx)
+            proj_translate_yx = tuple(ref_translate_yx)
+
+            crop_viewer = napari.Viewer(ndisplay=2, title="Crop ROI - all channels")
+
+            for lyr in validated_layers:
+                arr = np.asarray(lyr.data)
+                proj = np.max(arr, axis=tuple(range(arr.ndim - 2)))
+
+                scale = _as_nd_tuple(getattr(lyr, "scale", None), arr.ndim, 1.0)
+                translate = _as_nd_tuple(getattr(lyr, "translate", None), arr.ndim, 0.0)
+
+                kwargs = dict(
+                    name=f"{lyr.name}_maxproj",
+                    scale=tuple(scale[-2:]),
+                    translate=tuple(translate[-2:]),
+                    opacity=float(getattr(lyr, "opacity", 1.0)),
+                    blending=str(getattr(lyr, "blending", "additive")),
+                    visible=True,
+                    rgb=False,
+                )
+
+                try:
+                    kwargs["colormap"] = lyr.colormap
+                except Exception:
+                    pass
+
+                try:
+                    kwargs["contrast_limits"] = tuple(lyr.contrast_limits)
+                except Exception:
+                    pass
+
+                try:
+                    kwargs["gamma"] = float(lyr.gamma)
+                except Exception:
+                    pass
+
+                crop_viewer.add_image(proj, **kwargs)
+
+            shapes_layer = crop_viewer.add_shapes(
+                name="Crop ROI",
+                shape_type="polygon",
+                edge_width=2,
+                edge_color="yellow",
+                face_color=[1.0, 1.0, 0.0, 0.15],
+                opacity=1.0,
+                scale=proj_scale_yx,
+                translate=proj_translate_yx,
+            )
+
+            try:
+                shapes_layer.mode = "add_polygon"
+            except Exception:
+                pass
+
+            class CropWidget(QWidget):
+                def __init__(self):
+                    super().__init__()
+                    layout = QVBoxLayout()
+                    layout.addWidget(QLabel("Draw one or more polygons on the projection, then click crop."))
+                    crop_btn = QPushButton("Crop all channels in place")
+                    close_btn = QPushButton("Close")
+                    layout.addWidget(crop_btn)
+                    layout.addWidget(close_btn)
+                    self.setLayout(layout)
+                    crop_btn.clicked.connect(self._apply_crop)
+                    close_btn.clicked.connect(self._close_viewer)
+
+                def _close_viewer(self):
+                    try:
+                        crop_viewer.close()
+                    except Exception:
+                        pass
+
+                def _shape_vertices_to_ref_pixel_yx(self, verts):
+                    verts = np.asarray(verts, dtype=float)
+                    if verts.ndim != 2 or verts.shape[1] < 2:
+                        raise ValueError("ROI vertices are invalid.")
+
+                    yx_world = np.asarray(verts[:, -2:], dtype=float)
+                    yx = np.empty_like(yx_world, dtype=float)
+                    yx[:, 0] = (yx_world[:, 0] - proj_translate_yx[0]) / proj_scale_yx[0]
+                    yx[:, 1] = (yx_world[:, 1] - proj_translate_yx[1]) / proj_scale_yx[1]
+
+                    if not np.all(np.isfinite(yx)):
+                        raise ValueError("ROI contains non-finite coordinates.")
+
+                    return yx
+
+                def _build_mask_and_bbox(self):
+                    if len(shapes_layer.data) == 0:
+                        raise ValueError("Draw at least one polygon first.")
+
+                    try:
+                        selected = sorted(int(i) for i in shapes_layer.selected_data)
+                    except Exception:
+                        selected = []
+
+                    if not selected:
+                        selected = list(range(len(shapes_layer.data)))
+
+                    mask2d = np.zeros(base_yx, dtype=bool)
+
+                    for idx in selected:
+                        verts = np.asarray(shapes_layer.data[idx], dtype=float)
+                        if verts.ndim != 2 or verts.shape[0] < 3 or verts.shape[1] < 2:
+                            continue
+
+                        yx = self._shape_vertices_to_ref_pixel_yx(verts)
+
+                        yx[:, 0] = np.clip(yx[:, 0], -0.5, base_yx[0] - 0.5)
+                        yx[:, 1] = np.clip(yx[:, 1], -0.5, base_yx[1] - 0.5)
+
+                        poly_mask = polygon2mask(base_yx, yx)
+                        if np.any(poly_mask):
+                            mask2d |= poly_mask
+
+                    if not np.any(mask2d):
+                        raise ValueError("Selected ROI polygon(s) did not produce a valid mask.")
+
+                    if tight_bbox:
+                        yy, xx = np.where(mask2d)
+                        y0, y1 = int(yy.min()), int(yy.max()) + 1
+                        x0, x1 = int(xx.min()), int(xx.max()) + 1
+                    else:
+                        y0, y1 = 0, base_yx[0]
+                        x0, x1 = 0, base_yx[1]
+
+                    if y1 <= y0 or x1 <= x0:
+                        raise ValueError("Computed crop bounding box is empty.")
+
+                    return mask2d, (y0, y1, x0, x1)
+
+                def _crop_single_layer_in_place(self, image_layer, mask2d, bbox):
+                    y0, y1, x0, x1 = bbox
+
+                    old_data = np.asarray(image_layer.data)
+                    ndim = old_data.ndim
+                    if ndim < 3:
+                        raise ValueError("Layer is no longer 3D+.")
+
+                    slicer = (slice(None),) * (ndim - 2) + (slice(y0, y1), slice(x0, x1))
+                    cropped = np.array(old_data[slicer], copy=True, order="C")
+
+                    if cropped.size == 0:
+                        raise ValueError("Crop produced an empty array.")
+
+                    mask_crop = np.asarray(mask2d[y0:y1, x0:x1], dtype=bool)
+                    mask_view = mask_crop.reshape((1,) * (cropped.ndim - 2) + mask_crop.shape)
+
+                    try:
+                        fill_cast = np.asarray(fill_value, dtype=cropped.dtype)
+                    except Exception:
+                        raise ValueError(f"fill_value={fill_value!r} cannot be cast to dtype {cropped.dtype}")
+
+                    if not np.all(mask_crop):
+                        cropped = np.where(mask_view, cropped, fill_cast)
+
+                    old_scale = _as_nd_tuple(getattr(image_layer, "scale", None), ndim, 1.0)
+                    old_translate = list(_as_nd_tuple(getattr(image_layer, "translate", None), ndim, 0.0))
+
+                    old_translate[-2] = float(old_translate[-2]) + float(y0) * float(old_scale[-2])
+                    old_translate[-1] = float(old_translate[-1]) + float(x0) * float(old_scale[-1])
+
+                    image_layer.data = cropped
+
+                    try:
+                        image_layer.translate = tuple(old_translate)
+                    except Exception:
+                        pass
+
+                    try:
+                        image_layer.refresh()
+                    except Exception:
+                        pass
+
+                    return f"Updated: {image_layer.name} -> {cropped.shape}"
+
+                def _apply_crop(self):
+                    try:
+                        mask2d, bbox = self._build_mask_and_bbox()
+                    except Exception as e:
+                        QMessageBox.warning(self, "Crop", str(e))
+                        return
+
+                    try:
+                        crop_viewer.close()
+                    except Exception:
+                        pass
+
+                    def _do_crop():
+                        summary = []
+                        failed = []
+
+                        for image_layer in validated_layers:
+                            try:
+                                summary.append(self._crop_single_layer_in_place(image_layer, mask2d, bbox))
+                            except Exception as e:
+                                failed.append(f"{image_layer.name}: {e}")
+
+                        try:
+                            main_viewer.reset_view()
+                        except Exception:
+                            pass
+
+                        parts = []
+
+                        if summary:
+                            parts.append("Crop applied in place.")
+                            parts.append("")
+                            parts.extend(summary)
+
+                        if failed:
+                            if parts:
+                                parts.append("")
+                            parts.append("Failed:")
+                            parts.extend(failed)
+
+                        if rejected:
+                            if parts:
+                                parts.append("")
+                            parts.append("Skipped before cropping:")
+                            parts.extend(rejected)
+
+                        text = "\n".join(parts).strip() or "No layers were cropped."
+
+                        if summary:
+                            QMessageBox.information(_qt_parent(), "Crop", text)
+                        else:
+                            QMessageBox.warning(_qt_parent(), "Crop", text)
+
+                    QTimer.singleShot(0, _do_crop)
+
+            crop_widget = CropWidget()
+            crop_viewer.window.add_dock_widget(crop_widget, area="right")
+
+            if rejected:
+                QMessageBox.information(
+                    _qt_parent(),
+                    "Crop ROI",
+                    "Some layers were skipped because they do not share the same crop geometry.\n\n"
+                    + "\n".join(rejected),
+                )
+
+            return crop_viewer, shapes_layer
 
         def _refresh_z_controls():
             """Update n_z-dependent UI + refresh viewer to current slice."""
@@ -4005,6 +6842,10 @@ class UIWidget(QWidget):
         rot180 = QPushButton('Rotate 180')
         rot180.clicked.connect(lambda: self.rotate_stack(180))
         v.addWidget(rot180)
+
+        crop_btn = QPushButton("Crop to Selected Shape (All Z)")
+        v.addWidget(crop_btn)
+        crop_btn.clicked.connect(lambda: open_crop_projection_viewer(self))
 
         gen_mask_btn = QPushButton("Generate Mask Channel(s) (Otsu)")
 
@@ -4397,8 +7238,6 @@ class UIWidget(QWidget):
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load channels: {e}")
-
-
 
     def export_selected_layers(self):
         try:

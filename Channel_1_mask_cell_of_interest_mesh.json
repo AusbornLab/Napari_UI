@@ -1,0 +1,15 @@
+{
+    "source_layer": "Channel 1 mask",
+    "voxel_size_um": [
+        0.2985,
+        1.0,
+        1.0
+    ],
+    "keep_largest_component": true,
+    "fill_holes": true,
+    "remove_small_objects_min_voxels": 50,
+    "binary_closing_radius_px": 1,
+    "binary_opening_radius_px": 0,
+    "surface_smoothing_sigma_px": 0.8,
+    "marching_cubes_step_size": 2
+}
