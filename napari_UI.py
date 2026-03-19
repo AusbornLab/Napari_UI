@@ -1414,6 +1414,26 @@ class UIWidget(QWidget):
                     try:
                         lay.data = m2
                         lay.contrast_limits = (0, 1)
+                        # ---- FIX: keep mask scale/translate in sync with channel layer ----
+                        ch_layers = getattr(self, "channel_layers", [])
+                        if ch_idx < len(ch_layers):
+                            ref = ch_layers[ch_idx]
+                            raw_s = getattr(ref, "scale", None)
+                            raw_t = getattr(ref, "translate", None)
+                            if raw_s is not None:
+                                s = tuple(float(x) for x in raw_s)
+                                yx_s = s[-2:] if len(s) >= 2 else (1.0, 1.0)
+                                try:
+                                    lay.scale = yx_s
+                                except Exception:
+                                    pass
+                            if raw_t is not None:
+                                t = tuple(float(x) for x in raw_t)
+                                yx_t = t[-2:] if len(t) >= 2 else (0.0, 0.0)
+                                try:
+                                    lay.translate = yx_t
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
 
@@ -7120,22 +7140,65 @@ class UIWidget(QWidget):
         z = max(0, min(z, mask3.shape[0] - 1))
         mask2d = mask3[z]
 
+        # ---- FIX: inherit scale and translate from the matching channel layer
+        # so the 2D mask slice renders at exactly the same pixel positions as
+        # the channel image in the napari canvas. ----
+        ref_scale_yx = None
+        ref_translate_yx = None
+        try:
+            ch_layers = getattr(self, "channel_layers", [])
+            if ch_idx < len(ch_layers):
+                ref_lay = ch_layers[ch_idx]
+                ref_arr = np.asarray(ref_lay.data)
+                ndim_ref = ref_arr.ndim
+
+                raw_scale = getattr(ref_lay, "scale", None)
+                raw_translate = getattr(ref_lay, "translate", None)
+
+                if raw_scale is not None:
+                    s = tuple(float(v) for v in raw_scale)
+                    # Take last 2 elements (YX) regardless of whether
+                    # the channel layer is 2D or 3D
+                    ref_scale_yx = s[-2:] if len(s) >= 2 else (1.0, 1.0)
+
+                if raw_translate is not None:
+                    t = tuple(float(v) for v in raw_translate)
+                    ref_translate_yx = t[-2:] if len(t) >= 2 else (0.0, 0.0)
+        except Exception:
+            pass
+
+        add_kwargs = dict(
+            name=name,
+            colormap="yellow",
+            opacity=0.6,
+            blending="additive",
+            contrast_limits=(0, 1),
+        )
+        if ref_scale_yx is not None:
+            add_kwargs["scale"] = ref_scale_yx
+        if ref_translate_yx is not None:
+            add_kwargs["translate"] = ref_translate_yx
+
         try:
             lay = self.viewer.layers.get(name)
         except Exception:
             lay = None
 
         if lay is None:
-            lay = self.viewer.add_image(
-                mask2d,
-                name=name,
-                colormap="yellow",
-                opacity=0.6,
-                blending="additive",
-                contrast_limits=(0, 1),
-            )
+            lay = self.viewer.add_image(mask2d, **add_kwargs)
         else:
             lay.data = mask2d
+            # Re-apply scale/translate in case the layer existed from before crop
+            if ref_scale_yx is not None:
+                try:
+                    lay.scale = ref_scale_yx
+                except Exception:
+                    pass
+            if ref_translate_yx is not None:
+                try:
+                    lay.translate = ref_translate_yx
+                except Exception:
+                    pass
             try:
                 lay.contrast_limits = (0, 1)
             except Exception:
