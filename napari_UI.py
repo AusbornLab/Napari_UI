@@ -43,9 +43,8 @@ import gc
 import json
 import traceback
 from pathlib import Path
-
-import numpy as np
-import napari
+from readlif.reader import LifFile
+from oiffile import OifFile
 from qtpy.QtCore import QEventLoop, Qt
 from qtpy.QtWidgets import (
     QApplication,
@@ -87,6 +86,16 @@ from skimage.morphology import (
 ###############################################################################
 # ----------------------------- FILE LOADING ---------------------------------
 ###############################################################################
+from pathlib import Path
+from datetime import datetime
+import time
+import numpy as np
+import tifffile
+
+from aicsimageio import AICSImage
+from readlif.reader import LifFile
+from oiffile import OifFile
+
 
 def _estimate_contrast_limits(memmaps):
     contrast_limits = {}
@@ -118,6 +127,106 @@ def _make_output_memmaps(prefix, n_ch, n_z, y, x, out_dtype):
         paths.append(pth)
 
     return memmaps, paths
+
+
+def _write_array_to_memmaps(
+    arr_czyx,
+    voxel_size,
+    prefix,
+    max_ch=4,
+    chunk_size=64,
+    out_dtype=None,
+    flush_every=8,
+):
+    if arr_czyx.ndim != 4:
+        raise ValueError(f"Expected CZYX array, got shape {arr_czyx.shape}")
+
+    c_total = int(arr_czyx.shape[0])
+    n_ch = min(max_ch, max(1, c_total))
+    n_z = int(arr_czyx.shape[1])
+    y = int(arr_czyx.shape[2])
+    x = int(arr_czyx.shape[3])
+
+    src_dtype = np.dtype(arr_czyx.dtype)
+    if out_dtype is None:
+        out_dtype = src_dtype if src_dtype.itemsize <= 4 else np.float32
+    out_dtype = np.dtype(out_dtype)
+
+    memmaps, paths = _make_output_memmaps(prefix, n_ch, n_z, y, x, out_dtype)
+
+    print(f"Writing {prefix.upper()} data to memory-mapped files...")
+    start_time = time.time()
+    total_chunks = (n_z + chunk_size - 1) // chunk_size
+
+    for idx, start_z in enumerate(range(0, n_z, chunk_size)):
+        end_z = min(start_z + chunk_size, n_z)
+        block = np.asarray(arr_czyx[:n_ch, start_z:end_z], dtype=out_dtype)
+
+        for ch_i in range(n_ch):
+            memmaps[ch_i][start_z:end_z] = block[ch_i]
+
+        if ((idx + 1) % flush_every == 0) or (end_z == n_z):
+            for mm in memmaps:
+                mm.flush()
+
+        elapsed = time.time() - start_time
+        done = idx + 1
+        remaining = total_chunks - done
+        eta = remaining * (elapsed / done)
+        print(
+            f"  Processed slices {start_z}-{end_z-1} of {n_z-1} "
+            f"({elapsed:.1f}s elapsed, ~{eta:.1f}s remaining)"
+        )
+
+    contrast_limits = _estimate_contrast_limits(memmaps)
+    print(f"Voxel size (Z, Y, X): {voxel_size}")
+    print(f"Memory-mapped {prefix.upper()} files created successfully!")
+    return memmaps, contrast_limits, voxel_size, paths
+
+
+def _coerce_axes_to_czyx(arr, axes):
+    arr = np.asarray(arr)
+    axes = str(axes)
+
+    if len(axes) != arr.ndim:
+        raise ValueError(f"Axes '{axes}' do not match array shape {arr.shape}")
+
+    slicer = []
+    kept_axes = []
+    for ax, size in zip(axes, arr.shape):
+        if ax in "CZYX":
+            slicer.append(slice(None))
+            kept_axes.append(ax)
+        else:
+            slicer.append(0)
+
+    arr = arr[tuple(slicer)]
+    kept_axes = "".join(kept_axes)
+
+    target_axes = [ax for ax in "CZYX" if ax in kept_axes]
+    if set(target_axes) != set(kept_axes):
+        raise ValueError(f"Could not reconcile axes: input={axes}, kept={kept_axes}")
+
+    if len(target_axes) > 1:
+        perm = [kept_axes.index(ax) for ax in target_axes]
+        arr = np.transpose(arr, perm)
+
+    current_axes = "".join(target_axes)
+
+    if "C" not in current_axes:
+        arr = arr[np.newaxis, ...]
+        current_axes = "C" + current_axes
+
+    if "Z" not in current_axes:
+        c_pos = current_axes.index("C")
+        arr = np.expand_dims(arr, axis=c_pos + 1)
+        current_axes = current_axes[:c_pos + 1] + "Z" + current_axes[c_pos + 1:]
+
+    if current_axes != "CZYX":
+        perm = [current_axes.index(ax) for ax in "CZYX"]
+        arr = np.transpose(arr, perm)
+
+    return arr
 
 
 def _read_estimated_voxel_size(path):
@@ -173,7 +282,8 @@ def _read_estimated_voxel_size(path):
 
         return (z, y, x)
 
-def _read_lif_voxel_size_aics(path, reconstruct_mosaic=False):
+
+def _read_aics_voxel_size(path, reconstruct_mosaic=False):
     voxel_size = (1.0, 1.0, 1.0)
     try:
         img = AICSImage(str(path), reconstruct_mosaic=reconstruct_mosaic)
@@ -184,29 +294,278 @@ def _read_lif_voxel_size_aics(path, reconstruct_mosaic=False):
         pass
     return voxel_size
 
-def _normalize_tiff_to_czyx(arr, max_ch_hint=4):
-    if arr.ndim == 4:
-        a0, a1, a2, a3 = arr.shape
 
-        if a0 <= max_ch_hint and a1 > max_ch_hint:
-            return arr
+def load_tiff_like_memmap(
+    path,
+    max_ch=4,
+    chunk_size=64,
+    out_dtype=None,
+    flush_every=8,
+    series_index=0,
+    prefix="tiff",
+):
+    print(f"Creating memory-mapped arrays from {prefix.upper()}...")
 
-        if a1 <= max_ch_hint and a0 > max_ch_hint:
-            return np.moveaxis(arr, 1, 0)
+    with tifffile.TiffFile(str(path)) as tif:
+        series = tif.series[series_index]
+        axes = series.axes
+        shape = series.shape
+        print(f"{prefix.upper()} series axes={axes}, shape={shape}, dtype={series.dtype}")
 
-        return arr
+    try:
+        arr = tifffile.memmap(str(path))
+        if tuple(arr.shape) != tuple(shape):
+            raise ValueError("memmap shape does not match selected series")
+        print(f"{prefix.upper()} memmap opened successfully: shape={arr.shape}, dtype={arr.dtype}")
+    except Exception as e:
+        print(f"{prefix.upper()} memmap unavailable, falling back to asarray: {e}")
+        with tifffile.TiffFile(str(path)) as tif:
+            arr = tif.series[series_index].asarray()
+        print(f"{prefix.upper()} loaded via tifffile.asarray: shape={arr.shape}, dtype={arr.dtype}")
 
-    elif arr.ndim == 3:
-        return arr[np.newaxis, ...]
+    voxel_size = _read_estimated_voxel_size(path)
+    arr_czyx = _coerce_axes_to_czyx(arr, axes)
 
-    elif arr.ndim == 2:
-        return arr.reshape((1, 1) + arr.shape)
+    return _write_array_to_memmaps(
+        arr_czyx,
+        voxel_size,
+        prefix=prefix,
+        max_ch=max_ch,
+        chunk_size=chunk_size,
+        out_dtype=out_dtype,
+        flush_every=flush_every,
+    )
 
-    else:
-        arr_np = np.asarray(arr)
-        if arr_np.ndim >= 2:
-            return np.reshape(arr_np, (1, 1) + arr_np.shape[-2:])
-        raise ValueError(f"Unsupported TIFF shape: {arr.shape}")
+
+def load_tiff_memmap(path, max_ch=4, chunk_size=64, out_dtype=None, flush_every=8, series_index=0):
+    return load_tiff_like_memmap(
+        path,
+        max_ch=max_ch,
+        chunk_size=chunk_size,
+        out_dtype=out_dtype,
+        flush_every=flush_every,
+        series_index=series_index,
+        prefix="tiff",
+    )
+
+
+def inspect_oib_metadata(path):
+    with OifFile(str(path)) as oib:
+        print("axes:", oib.axes)
+        print("shape:", oib.shape)
+        print("dtype:", oib.dtype)
+        print("mainfile sections:")
+        for k in oib.mainfile.keys():
+            print(" ", k)
+
+
+def _read_oib_voxel_size(path):
+    voxel_size = (1.0, 1.0, 1.0)
+
+    try:
+        with OifFile(str(path)) as oib:
+            mf = oib.mainfile
+
+            candidates = [
+                ("Axis 3 Parameters Common", "Interval"),
+                ("Axis 2 Parameters Common", "Interval"),
+                ("Axis 1 Parameters Common", "Interval"),
+            ]
+
+            vals = []
+            for section, key in candidates:
+                try:
+                    vals.append(float(mf[section][key]))
+                except Exception:
+                    vals.append(None)
+
+            # Keep your current mapping for now; verify with a real Olympus file.
+            if vals[0] is not None and vals[1] is not None:
+                x = vals[0]
+                y = vals[1]
+                z = vals[2] if vals[2] is not None else 1.0
+                voxel_size = (float(z), float(y), float(x))
+    except Exception:
+        pass
+
+    return voxel_size
+
+def _read_lsm_voxel_size(path):
+    """
+    Return voxel size as (Z, Y, X) in microns for Zeiss LSM.
+    """
+    with tifffile.TiffFile(str(path)) as tif:
+        md = getattr(tif, "lsm_metadata", None)
+
+        z = y = x = None
+
+        # 1) tifffile parsed LSM metadata
+        if md is not None:
+            if isinstance(md, dict):
+                z = md.get("VoxelSizeZ", md.get("voxel_size_z", None))
+                y = md.get("VoxelSizeY", md.get("voxel_size_y", None))
+                x = md.get("VoxelSizeX", md.get("voxel_size_x", None))
+            else:
+                for attr in ("VoxelSizeZ", "voxel_size_z"):
+                    if hasattr(md, attr):
+                        z = getattr(md, attr)
+                        break
+                for attr in ("VoxelSizeY", "voxel_size_y"):
+                    if hasattr(md, attr):
+                        y = getattr(md, attr)
+                        break
+                for attr in ("VoxelSizeX", "voxel_size_x"):
+                    if hasattr(md, attr):
+                        x = getattr(md, attr)
+                        break
+
+        # 2) page-level fallback
+        if z is None or y is None or x is None:
+            try:
+                cz = getattr(tif.pages[0], "cz_lsm_info", None)
+                if cz is not None:
+                    if z is None:
+                        for attr in ("VoxelSizeZ", "voxel_size_z"):
+                            if hasattr(cz, attr):
+                                z = getattr(cz, attr)
+                                break
+                    if y is None:
+                        for attr in ("VoxelSizeY", "voxel_size_y"):
+                            if hasattr(cz, attr):
+                                y = getattr(cz, attr)
+                                break
+                    if x is None:
+                        for attr in ("VoxelSizeX", "voxel_size_x"):
+                            if hasattr(cz, attr):
+                                x = getattr(cz, attr)
+                                break
+            except Exception:
+                pass
+
+        # 3) generic fallback
+        if z is None or y is None or x is None:
+            print("LSM-specific voxel metadata not found; falling back to generic TIFF estimate")
+            return _read_estimated_voxel_size(path)
+
+        z = float(z)
+        y = float(y)
+        x = float(x)
+
+        raw_voxel_size = (z, y, x)
+
+        # Zeiss LSM metadata is commonly encountered here in meters;
+        # convert to microns for napari scale / your pipeline.
+        if max(raw_voxel_size) < 1e-3:
+            voxel_size = (z * 1e6, y * 1e6, x * 1e6)
+            unit = "um"
+        else:
+            voxel_size = raw_voxel_size
+            unit = "um"
+
+        print("=== LSM voxel size ===")
+        print("Raw:", raw_voxel_size)
+        print("Converted Z:", voxel_size[0], unit)
+        print("Converted Y:", voxel_size[1], unit)
+        print("Converted X:", voxel_size[2], unit)
+
+        return voxel_size
+
+
+def load_lsm_memmap(path, max_ch=4, chunk_size=64, out_dtype=None, flush_every=8, series_index=0):
+    print("Creating memory-mapped arrays from LSM...")
+
+    with tifffile.TiffFile(str(path)) as tif:
+        series = tif.series[series_index]
+        axes = series.axes
+        shape = series.shape
+        dtype = series.dtype
+        print(f"LSM series axes={axes}, shape={shape}, dtype={dtype}")
+
+        # LSM is often not source-memory-mappable; read selected series eagerly
+        arr = series.asarray()
+
+    voxel_size = _read_lsm_voxel_size(path)
+    arr_czyx = _coerce_axes_to_czyx(arr, axes)
+
+    return _write_array_to_memmaps(
+        arr_czyx,
+        voxel_size,
+        prefix="lsm",
+        max_ch=max_ch,
+        chunk_size=chunk_size,
+        out_dtype=out_dtype,
+        flush_every=flush_every,
+    )
+
+
+def load_oib_memmap(path, max_ch=4, chunk_size=64, out_dtype=None, flush_every=8):
+    print("Creating memory-mapped arrays from OIB/OIF...")
+
+    with OifFile(str(path)) as oib:
+        axes = oib.axes
+        shape = oib.shape
+        dtype = oib.dtype
+        print(f"OIB/OIF axes={axes}, shape={shape}, dtype={dtype}")
+        arr = oib.asarray()
+
+    voxel_size = _read_oib_voxel_size(path)
+    arr_czyx = _coerce_axes_to_czyx(arr, axes)
+
+    return _write_array_to_memmaps(
+        arr_czyx,
+        voxel_size,
+        prefix="oib",
+        max_ch=max_ch,
+        chunk_size=chunk_size,
+        out_dtype=out_dtype,
+        flush_every=flush_every,
+    )
+
+
+def load_oir_memmap(
+    path,
+    scene_index=0,
+    max_ch=4,
+    chunk_size=64,
+    out_dtype=None,
+    flush_every=8,
+    reconstruct_mosaic=False,
+):
+    print("Creating memory-mapped arrays from OIR...")
+
+    img = AICSImage(str(path), reconstruct_mosaic=reconstruct_mosaic)
+
+    # Eager read, not dask
+    try:
+        arr = img.get_image_data("CZYX", S=scene_index)
+        axes = "CZYX"
+    except Exception:
+        try:
+            arr = img.get_image_data("CYX", S=scene_index)
+            axes = "CYX"
+        except Exception:
+            arr = img.get_image_data("ZYX", S=scene_index)
+            axes = "ZYX"
+
+    voxel_size = (1.0, 1.0, 1.0)
+    try:
+        p = getattr(img, "physical_pixel_sizes", None)
+        if p is not None and p.Z is not None and p.Y is not None and p.X is not None:
+            voxel_size = (float(p.Z), float(p.Y), float(p.X))
+    except Exception:
+        pass
+
+    arr_czyx = _coerce_axes_to_czyx(arr, axes)
+
+    return _write_array_to_memmaps(
+        arr_czyx,
+        voxel_size,
+        prefix="oir",
+        max_ch=max_ch,
+        chunk_size=chunk_size,
+        out_dtype=out_dtype,
+        flush_every=flush_every,
+    )
 
 
 def load_lif_memmap(path, scene_index=0, max_ch=4, out_dtype=None, flush_every=8):
@@ -232,9 +591,7 @@ def load_lif_memmap(path, scene_index=0, max_ch=4, out_dtype=None, flush_every=8
         out_dtype = src_dtype if np.dtype(src_dtype).itemsize <= 4 else np.float32
     out_dtype = np.dtype(out_dtype)
 
-    voxel_size = _read_lif_voxel_size_aics(path, reconstruct_mosaic=False)
-    
-
+    voxel_size = _read_aics_voxel_size(path, reconstruct_mosaic=False)
     memmaps, paths = _make_output_memmaps("lif", n_ch, num_z, y, x, out_dtype)
 
     print("Writing LIF frames to memory-mapped files...")
@@ -262,72 +619,20 @@ def load_lif_memmap(path, scene_index=0, max_ch=4, out_dtype=None, flush_every=8
     return memmaps, contrast_limits, voxel_size, paths
 
 
-def load_tiff_memmap(path, max_ch=4, chunk_size=64, out_dtype=None, flush_every=8):
-    """
-    Load TIFF with no Dask/AICS fallback.
-    Prefer tifffile.memmap; fall back to tifffile.imread if memmap is unavailable.
-    """
-    print("Creating memory-mapped arrays from TIFF")
-
-    try:
-        arr = tifffile.memmap(str(path))
-        print(f"TIFF memmap opened successfully: shape={arr.shape}, dtype={arr.dtype}")
-    except Exception as e:
-        print(f"tifffile.memmap unavailable, falling back to imread: {e}")
-        arr = tifffile.imread(str(path))
-        print(f"TIFF loaded into RAM via tifffile.imread: shape={arr.shape}, dtype={arr.dtype}")
-
-    voxel_size = _read_estimated_voxel_size(path)
-    arr_czyx = _normalize_tiff_to_czyx(arr, max_ch_hint=max_ch)
-
-    c_total = int(arr_czyx.shape[0])
-    n_ch = min(max_ch, max(1, c_total))
-    n_z = int(arr_czyx.shape[1])
-    y = int(arr_czyx.shape[2])
-    x = int(arr_czyx.shape[3])
-
-    src_dtype = np.dtype(arr_czyx.dtype)
-    if out_dtype is None:
-        out_dtype = src_dtype if src_dtype.itemsize <= 4 else np.float32
-    out_dtype = np.dtype(out_dtype)
-
-    memmaps, paths = _make_output_memmaps("tiff", n_ch, n_z, y, x, out_dtype)
-
-    print("Writing TIFF data to memory-mapped files...")
-    start_time = time.time()
-    total_chunks = (n_z + chunk_size - 1) // chunk_size
-
-    for idx, start_z in enumerate(range(0, n_z, chunk_size)):
-        end_z = min(start_z + chunk_size, n_z)
-
-        block = np.asarray(arr_czyx[:n_ch, start_z:end_z], dtype=out_dtype)
-
-        for ch_i in range(n_ch):
-            memmaps[ch_i][start_z:end_z] = block[ch_i]
-
-        if ((idx + 1) % flush_every == 0) or (end_z == n_z):
-            for mm in memmaps:
-                mm.flush()
-
-        elapsed = time.time() - start_time
-        done = idx + 1
-        remaining = total_chunks - done
-        eta = remaining * (elapsed / done)
-        print(
-            f"  Processed slices {start_z}-{end_z-1} of {n_z-1} "
-            f"({elapsed:.1f}s elapsed, ~{eta:.1f}s remaining)"
-        )
-
-    contrast_limits = _estimate_contrast_limits(memmaps)
-
-    print(f"Voxel size (Z, Y, X): {voxel_size}")
-    print("Memory-mapped TIFF files created successfully!")
-    return memmaps, contrast_limits, voxel_size, paths
-
-
-def load_image_memmap(path, scene_index=0, max_ch=4, chunk_size=64, out_dtype=None, flush_every=8):
+def load_image_memmap(
+    path,
+    scene_index=0,
+    max_ch=4,
+    chunk_size=64,
+    out_dtype=None,
+    flush_every=8,
+    reconstruct_mosaic=False,
+    series_index=0,
+):
     p = Path(path)
-    if p.suffix.lower() == ".lif":
+    suffix = p.suffix.lower()
+
+    if suffix == ".lif":
         return load_lif_memmap(
             p,
             scene_index=scene_index,
@@ -335,13 +640,50 @@ def load_image_memmap(path, scene_index=0, max_ch=4, chunk_size=64, out_dtype=No
             out_dtype=out_dtype,
             flush_every=flush_every,
         )
-    return load_tiff_memmap(
-        p,
-        max_ch=max_ch,
-        chunk_size=chunk_size,
-        out_dtype=out_dtype,
-        flush_every=flush_every,
-    )
+
+    if suffix in {".tif", ".tiff"}:
+        return load_tiff_memmap(
+            p,
+            max_ch=max_ch,
+            chunk_size=chunk_size,
+            out_dtype=out_dtype,
+            flush_every=flush_every,
+            series_index=series_index,
+        )
+
+    if suffix == ".lsm":
+        return load_lsm_memmap(
+            p,
+            max_ch=max_ch,
+            chunk_size=chunk_size,
+            out_dtype=out_dtype,
+            flush_every=flush_every,
+            series_index=series_index,
+        )
+
+    if suffix in {".oib", ".oif"}:
+        return load_oib_memmap(
+            p,
+            max_ch=max_ch,
+            chunk_size=chunk_size,
+            out_dtype=out_dtype,
+            flush_every=flush_every,
+        )
+
+    if suffix == ".oir":
+        return load_oir_memmap(
+            p,
+            scene_index=scene_index,
+            max_ch=max_ch,
+            chunk_size=chunk_size,
+            out_dtype=out_dtype,
+            flush_every=flush_every,
+            reconstruct_mosaic=reconstruct_mosaic,
+        )
+
+    raise ValueError(f"Unsupported file type: {suffix}")
+
+
 ###############################################################################
 # ----------------------------- MASK COMPUTATION-----------------------------
 ###############################################################################

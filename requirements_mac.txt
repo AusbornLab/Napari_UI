@@ -183,3 +183,14 @@ xsdata==25.7
 yarl==1.22.0
 zarr==2.15.0
 zipp==3.23.0
+bioformats-jar==2020.5.27
+cjdk==0.5.0
+jgo==2.2.0
+jpype1==1.7.0
+oiffile==2026.2.8
+progressbar2==4.5.0
+pyqtgraph==0.14.0
+python-utils==3.9.1
+rich-click==1.9.7
+scyjava==1.12.5
+semver==3.0.4
