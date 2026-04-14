@@ -20,6 +20,7 @@ from skimage.filters import gaussian, threshold_otsu
 from skimage.morphology import remove_small_objects, closing, disk, dilation, ball, binary_opening, binary_closing
 from aicsimageio import AICSImage
 import tifffile
+from readlif.reader import LifFile
 import imageio
 from skimage.transform import rotate
 from skimage.measure import label, regionprops
@@ -37,6 +38,44 @@ from cellpose import io as cellpose_io
 import traceback
 from scipy.spatial import cKDTree
 from skimage.measure import marching_cubes
+import csv
+import gc
+import json
+import traceback
+from pathlib import Path
+
+import numpy as np
+import napari
+from qtpy.QtCore import QEventLoop, Qt
+from qtpy.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGridLayout,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+from scipy import ndimage as ndi
+from scipy.spatial import cKDTree
+from skimage.measure import marching_cubes
+from skimage.morphology import (
+    ball,
+    binary_closing,
+    binary_opening,
+    remove_small_objects,
+)
 
 
 
@@ -49,119 +88,36 @@ from skimage.measure import marching_cubes
 # ----------------------------- FILE LOADING ---------------------------------
 ###############################################################################
 
-def load_lif_memmap(path, scene_index=0, max_ch=4):
-    """Load LIF using memory mapping for instant slice access without RAM overhead.
-    Returns (list_of_memmaps, contrast_limits_dict, voxel_size(Z,Y,X), paths).
-    """
-    print("Creating memory-mapped arrays from LIF (memmap)...")
-    img = AICSImage(str(path))
-
-    # Determine number of channels
-    try:
-        c_total = int(img.dims.C)
-    except Exception:
-        c_total = 1
-
-    n_ch = min(max_ch, max(1, c_total))
-
-    # Get the underlying dask array in CZYX order if possible
-    try:
-        arr = img.get_image_dask_data("CZYX", S=scene_index)
-    except Exception:
-        arr = img.get_image_dask_data("CYX", S=scene_index)
-
-    print(f"Image array shape (expected C,Z,Y,X or C,Y,X): {arr.shape}")
-
-    voxel_size = (1.0, 1.0, 1.0)
-    try:
-        p = getattr(img, "physical_pixel_sizes", None)
-        if p is not None:
-            # NamedTuple: PhysicalPixelSizes(Z=..., Y=..., X=...) 
-            if hasattr(p, "Z") and hasattr(p, "Y") and hasattr(p, "X"):
-                z = p.Z
-                y = p.Y
-                x = p.X
-            else:
-                # tuple-like; docs indicate order Z,Y,X 
-                z, y, x = tuple(p)[:3]
-
-            if z is not None and y is not None and x is not None:
-                voxel_size = (float(z), float(y), float(x))
-        else:
-            # Older AICSImageIO API: returns X,Y,Z 
-            if hasattr(img, "get_physical_pixel_size"):
-                pxyz = img.get_physical_pixel_size(scene_index)
-                if isinstance(pxyz, (list, tuple)) and len(pxyz) >= 3:
-                    x, y, z = pxyz[:3]
-                    voxel_size = (float(z), float(y), float(x))
-    except Exception:
-        pass
-
-    # Create temporary memory-mapped files
-    temp_dir = Path.cwd() / "napari_mmap_files"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-
-    # Normalize arr to shape (C,Z,Y,X) where possible
-    if arr.ndim == 4:
-        c, z, y, x = arr.shape
-    elif arr.ndim == 3:
-        # could be (C,Y,X) -> treat Z=1
-        c = arr.shape[0]
-        z = 1
-        y = arr.shape[1]
-        x = arr.shape[2]
-    else:
-        raise ValueError(f"Unsupported LIF array shape: {arr.shape}")
-
-    n_z = z
-
-    # create memmaps for up to n_ch channels
-    memmaps = []
-    paths = []
-    for ch_idx in range(min(n_ch, c)):
-        pth = temp_dir / f"ch{ch_idx+1}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.dat"
-        mm = np.memmap(pth, dtype=np.float32, mode='w+', shape=(n_z, y, x))
-        memmaps.append(mm)
-        paths.append(pth)
-
-    print("Writing data to memory-mapped files (this may take a few minutes)...")
-    chunk_size = 30
-    start_time = time.time()
-
-    for idx, start_z in enumerate(range(0, n_z, chunk_size)):
-        end_z = min(start_z + chunk_size, n_z)
-        for ch_i in range(len(memmaps)):
-            if arr.ndim == 4:
-                chunk = arr[ch_i, start_z:end_z].compute().astype(np.float32)
-            else:
-                chunk = arr[ch_i][np.newaxis, ...].astype(np.float32)
-
-            memmaps[ch_i][start_z:end_z] = chunk
-            memmaps[ch_i].flush()
-
-        elapsed = time.time() - start_time
-        chunks_done = idx + 1
-        total_chunks = (n_z + chunk_size - 1) // chunk_size
-        remaining_chunks = total_chunks - chunks_done
-        time_per_chunk = elapsed / chunks_done
-        est_remaining = remaining_chunks * time_per_chunk
-        print(f"  Processed slices {start_z}-{end_z-1} of {n_z-1} ({elapsed:.1f}s elapsed, ~{est_remaining:.1f}s remaining)")
-
-    print("Memory-mapped files created successfully!")
-
-    # Calculate contrast limits per channel
+def _estimate_contrast_limits(memmaps):
     contrast_limits = {}
-    mid_z = max(0, n_z // 2)
     for i, mm in enumerate(memmaps, start=1):
         try:
+            mid_z = max(0, mm.shape[0] // 2)
             sample = mm[mid_z]
+            if sample.shape[0] > 1024 or sample.shape[1] > 1024:
+                sample = sample[::2, ::2]
             lo, hi = np.percentile(sample, [1, 99.5])
         except Exception:
             lo, hi = 0, 65535
-        contrast_limits[f'ch{i}'] = (float(lo), float(hi))
+        contrast_limits[f"ch{i}"] = (float(lo), float(hi))
+    return contrast_limits
 
-    print(f"Voxel size (Z, Y, X): {voxel_size}")
-    return memmaps, contrast_limits, voxel_size, paths
+
+def _make_output_memmaps(prefix, n_ch, n_z, y, x, out_dtype):
+    temp_dir = Path.cwd() / "napari_mmap_files"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    memmaps = []
+    paths = []
+
+    for ch_idx in range(n_ch):
+        pth = temp_dir / f"{prefix}_ch{ch_idx+1}_{stamp}.dat"
+        mm = np.memmap(pth, dtype=out_dtype, mode="w+", shape=(n_z, y, x))
+        memmaps.append(mm)
+        paths.append(pth)
+
+    return memmaps, paths
 
 
 def _read_estimated_voxel_size(path):
@@ -171,7 +127,6 @@ def _read_estimated_voxel_size(path):
         voxel_x = None
         unit = None
 
-        # ImageJ metadata
         try:
             ij = tif.imagej_metadata
         except Exception:
@@ -181,7 +136,6 @@ def _read_estimated_voxel_size(path):
             voxel_z = ij.get("spacing", None)
             unit = ij.get("unit", None)
 
-        # TIFF tags
         page = tif.pages[0]
         tags = page.tags
 
@@ -203,12 +157,10 @@ def _read_estimated_voxel_size(path):
 
         if "ResolutionUnit" in tags:
             try:
-                ru = tags["ResolutionUnit"].value
-                print("Raw ResolutionUnit:", ru)
+                unit = tags["ResolutionUnit"].value
+                print("Raw ResolutionUnit:", unit)
             except Exception:
-                ru = None
-        else:
-            ru = None
+                unit = None
 
         z = 1.0 if voxel_z is None else float(voxel_z)
         y = 1.0 if voxel_y is None else float(voxel_y)
@@ -221,115 +173,175 @@ def _read_estimated_voxel_size(path):
 
         return (z, y, x)
 
-def load_tiff_memmap(path, max_ch=4):
-    """Load TIFF using memory-mapped arrays via tifffile, write float32 memmaps.
-    Returns (list_of_memmaps, contrast_limits_dict, voxel_size(Z,Y,X), paths).
-    Tries to extract voxel size from:
-      1) OME-TIFF OME-XML
-      2) ImageJ metadata
-      3) TIFF resolution tags
-    """
-
-
-    print("Creating memory-mapped arrays from TIFF (memmap) using tifffile...")
-    # ---------- read pixels (prefer memmap) ----------
+def _read_lif_voxel_size_aics(path, reconstruct_mosaic=False):
+    voxel_size = (1.0, 1.0, 1.0)
     try:
-        data = tifffile.memmap(str(path))
-        arr = np.asarray(data)
+        img = AICSImage(str(path), reconstruct_mosaic=reconstruct_mosaic)
+        p = getattr(img, "physical_pixel_sizes", None)
+        if p is not None and p.Z is not None and p.Y is not None and p.X is not None:
+            voxel_size = (float(p.Z), float(p.Y), float(p.X))
     except Exception:
-        try:
-            arr = tifffile.imread(str(path))
-        except Exception as e:
-            # last resort: AICSImage -> delegate
-            img = AICSImage(str(path))
-            try:
-                arr = img.get_image_dask_data("CZYX")
-            except Exception:
-                arr = img.get_image_dask_data("CYX")
-            try:
-                c_total = int(img.dims.C)
-            except Exception:
-                c_total = arr.shape[0] if arr.ndim == 4 else 1
-            return load_lif_memmap(path, scene_index=0, max_ch=min(max_ch, max(1, c_total)))
+        pass
+    return voxel_size
 
-
-    # ---------- extract voxel size ----------
-    voxel_size = _read_estimated_voxel_size(path)
-    # ---------- normalize array into (C, Z, Y, X) ----------
-    arr = np.asarray(arr)
+def _normalize_tiff_to_czyx(arr, max_ch_hint=4):
     if arr.ndim == 4:
         a0, a1, a2, a3 = arr.shape
-        if a0 <= 4 and a1 > 4:
-            arr_czyx = arr  # (C,Z,Y,X)
-        elif a1 <= 4 and a0 > 4:
-            arr_czyx = np.moveaxis(arr, [0, 1], [1, 0])  # (Z,C,Y,X)->(C,Z,Y,X)
-        else:
-            arr_czyx = arr
+
+        if a0 <= max_ch_hint and a1 > max_ch_hint:
+            return arr
+
+        if a1 <= max_ch_hint and a0 > max_ch_hint:
+            return np.moveaxis(arr, 1, 0)
+
+        return arr
+
     elif arr.ndim == 3:
-        arr_czyx = np.expand_dims(arr, axis=0)  # (1,Z,Y,X)
+        return arr[np.newaxis, ...]
+
     elif arr.ndim == 2:
-        arr_czyx = arr.reshape((1, 1) + arr.shape)  # (1,1,Y,X)
+        return arr.reshape((1, 1) + arr.shape)
+
     else:
-        arr_czyx = np.reshape(arr, (1, 1) + arr.shape[-2:])
+        arr_np = np.asarray(arr)
+        if arr_np.ndim >= 2:
+            return np.reshape(arr_np, (1, 1) + arr_np.shape[-2:])
+        raise ValueError(f"Unsupported TIFF shape: {arr.shape}")
 
 
-    c_total = arr_czyx.shape[0]
-    n_ch = min(max_ch, max(1, c_total))
+def load_lif_memmap(path, scene_index=0, max_ch=4, out_dtype=None, flush_every=8):
+    print("Creating memory-mapped arrays from LIF")
 
+    lif = LifFile(str(path))
+    lif_image = lif.get_image(scene_index)
+    info = lif_image.info
 
-    # ---------- write float32 memmaps ----------
-    temp_dir = Path.cwd() / "napari_mmap_files"
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    dims = info.get("dims")
+    num_z = int(getattr(dims, "z", 1) or 1)
+    num_channels = int(info.get("channels", 1) or 1)
+    n_ch = min(max_ch, max(1, num_channels))
 
+    first = np.asarray(lif_image.get_frame(z=0, c=0))
+    if first.ndim != 2:
+        raise ValueError(f"Expected 2D frame from LIF, got shape {first.shape}")
 
-    n_z, y, x = arr_czyx.shape[1], arr_czyx.shape[2], arr_czyx.shape[3]
+    y, x = first.shape
+    src_dtype = first.dtype
 
+    if out_dtype is None:
+        out_dtype = src_dtype if np.dtype(src_dtype).itemsize <= 4 else np.float32
+    out_dtype = np.dtype(out_dtype)
 
-    memmaps = []
-    paths = []
-    for ch_idx in range(n_ch):
-        p = temp_dir / f"ch{ch_idx+1}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.dat"
-        mm = np.memmap(p, dtype=np.float32, mode='w+', shape=(n_z, y, x))
-        memmaps.append(mm)
-        paths.append(p)
+    voxel_size = _read_lif_voxel_size_aics(path, reconstruct_mosaic=False)
+    
 
+    memmaps, paths = _make_output_memmaps("lif", n_ch, num_z, y, x, out_dtype)
 
-    print("Writing data to memory-mapped files (this may take a few minutes)...")
-    chunk_size = 30
+    print("Writing LIF frames to memory-mapped files...")
     start_time = time.time()
-    for idx, start_z in enumerate(range(0, n_z, chunk_size)):
-        end_z = min(start_z + chunk_size, n_z)
-        for ch_i in range(n_ch):
-            chunk = arr_czyx[ch_i, start_z:end_z].astype(np.float32, copy=False)
-            memmaps[ch_i][start_z:end_z] = chunk
-            memmaps[ch_i].flush()
 
+    for z in range(num_z):
+        for ch in range(n_ch):
+            frame = np.asarray(lif_image.get_frame(z=z, c=ch), dtype=out_dtype)
+            memmaps[ch][z] = frame
+
+        if ((z + 1) % flush_every == 0) or (z == num_z - 1):
+            for mm in memmaps:
+                mm.flush()
 
         elapsed = time.time() - start_time
-        chunks_done = idx + 1
-        total_chunks = (n_z + chunk_size - 1) // chunk_size
-        remaining_chunks = total_chunks - chunks_done
-        time_per_chunk = elapsed / chunks_done
-        est_remaining = remaining_chunks * time_per_chunk
-        print(f"  Processed slices {start_z}-{end_z-1} of {n_z-1} ({elapsed:.1f}s elapsed, ~{est_remaining:.1f}s remaining)")
+        done = z + 1
+        remaining = num_z - done
+        eta = remaining * (elapsed / done)
+        print(f"  Processed slice {z} of {num_z - 1} ({elapsed:.1f}s elapsed, ~{eta:.1f}s remaining)")
+
+    contrast_limits = _estimate_contrast_limits(memmaps)
+
+    print("Memory-mapped files created successfully!")
+    print(f"Voxel size (Z, Y, X): {voxel_size}")
+    return memmaps, contrast_limits, voxel_size, paths
 
 
-    # ---------- contrast limits ----------
-    contrast_limits = {}
-    mid_z = max(0, n_z // 2)
-    for i, mm in enumerate(memmaps, start=1):
-        try:
-            sample = mm[mid_z]
-            lo, hi = np.percentile(sample, [1, 99.5])
-        except Exception:
-            lo, hi = 0, 65535
-        contrast_limits[f'ch{i}'] = (float(lo), float(hi))
+def load_tiff_memmap(path, max_ch=4, chunk_size=64, out_dtype=None, flush_every=8):
+    """
+    Load TIFF with no Dask/AICS fallback.
+    Prefer tifffile.memmap; fall back to tifffile.imread if memmap is unavailable.
+    """
+    print("Creating memory-mapped arrays from TIFF (no dask)...")
 
+    try:
+        arr = tifffile.memmap(str(path))
+        print(f"TIFF memmap opened successfully: shape={arr.shape}, dtype={arr.dtype}")
+    except Exception as e:
+        print(f"tifffile.memmap unavailable, falling back to imread: {e}")
+        arr = tifffile.imread(str(path))
+        print(f"TIFF loaded into RAM via tifffile.imread: shape={arr.shape}, dtype={arr.dtype}")
+
+    voxel_size = _read_estimated_voxel_size(path)
+    arr_czyx = _normalize_tiff_to_czyx(arr, max_ch_hint=max_ch)
+
+    c_total = int(arr_czyx.shape[0])
+    n_ch = min(max_ch, max(1, c_total))
+    n_z = int(arr_czyx.shape[1])
+    y = int(arr_czyx.shape[2])
+    x = int(arr_czyx.shape[3])
+
+    src_dtype = np.dtype(arr_czyx.dtype)
+    if out_dtype is None:
+        out_dtype = src_dtype if src_dtype.itemsize <= 4 else np.float32
+    out_dtype = np.dtype(out_dtype)
+
+    memmaps, paths = _make_output_memmaps("tiff", n_ch, n_z, y, x, out_dtype)
+
+    print("Writing TIFF data to memory-mapped files...")
+    start_time = time.time()
+    total_chunks = (n_z + chunk_size - 1) // chunk_size
+
+    for idx, start_z in enumerate(range(0, n_z, chunk_size)):
+        end_z = min(start_z + chunk_size, n_z)
+
+        block = np.asarray(arr_czyx[:n_ch, start_z:end_z], dtype=out_dtype)
+
+        for ch_i in range(n_ch):
+            memmaps[ch_i][start_z:end_z] = block[ch_i]
+
+        if ((idx + 1) % flush_every == 0) or (end_z == n_z):
+            for mm in memmaps:
+                mm.flush()
+
+        elapsed = time.time() - start_time
+        done = idx + 1
+        remaining = total_chunks - done
+        eta = remaining * (elapsed / done)
+        print(
+            f"  Processed slices {start_z}-{end_z-1} of {n_z-1} "
+            f"({elapsed:.1f}s elapsed, ~{eta:.1f}s remaining)"
+        )
+
+    contrast_limits = _estimate_contrast_limits(memmaps)
 
     print(f"Voxel size (Z, Y, X): {voxel_size}")
     print("Memory-mapped TIFF files created successfully!")
     return memmaps, contrast_limits, voxel_size, paths
 
+
+def load_image_memmap(path, scene_index=0, max_ch=4, chunk_size=64, out_dtype=None, flush_every=8):
+    p = Path(path)
+    if p.suffix.lower() == ".lif":
+        return load_lif_memmap(
+            p,
+            scene_index=scene_index,
+            max_ch=max_ch,
+            out_dtype=out_dtype,
+            flush_every=flush_every,
+        )
+    return load_tiff_memmap(
+        p,
+        max_ch=max_ch,
+        chunk_size=chunk_size,
+        out_dtype=out_dtype,
+        flush_every=flush_every,
+    )
 ###############################################################################
 # ----------------------------- MASK COMPUTATION-----------------------------
 ###############################################################################
@@ -477,6 +489,14 @@ class MaskTunerDialog(QDialog):
         # ---- embedded viewer + right panel ----
         self.viewer = napari.Viewer()
 
+        try:
+            self.viewer.window._qt_window.hide()
+        except Exception:
+            try:
+                self.viewer.window.hide()
+            except Exception:
+                pass
+
         split = QSplitter(Qt.Horizontal)
         outer.addWidget(split)
 
@@ -569,8 +589,6 @@ class MaskTunerDialog(QDialog):
         self.sigma_val.setFixedWidth(60)
         ctrl.addWidget(self.sigma_val)
 
-        self.preview_all_btn = QPushButton("Preview full stack")
-        ctrl.addWidget(self.preview_all_btn)
 
         self.accept_btn = QPushButton("Accept (write to main)")
         ctrl.addWidget(self.accept_btn)
@@ -593,7 +611,6 @@ class MaskTunerDialog(QDialog):
         self.sigma_slider.valueChanged.connect(self._on_sigma_changed)
 
         self.otsu_btn.clicked.connect(self._otsu_current_slice)
-        self.preview_all_btn.clicked.connect(self._preview_full_stack)
         self.accept_btn.clicked.connect(self._accept_mask)
 
         self.save_meta_btn.clicked.connect(self._save_channel_meta)
@@ -966,7 +983,7 @@ class MaskTunerDialog(QDialog):
         try:
             self._refresh_source_from_parent()
 
-            # Always build a complete 3D mask using the *current* parameters
+            # Always build a complete 3D mask using the current parameters
             self._preview_full_stack()
 
             masks_out = (self.preview_masks > 0).astype(np.uint8)
@@ -976,6 +993,9 @@ class MaskTunerDialog(QDialog):
                 self.parent_widget.z_changed(int(getattr(self.parent_widget, "current_z", self.z)))
             except Exception:
                 pass
+
+            # Explicitly close the extra napari viewer here
+            self._close_extra_viewer()
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to write mask to main UI: {e}")
@@ -1242,14 +1262,27 @@ class MaskTunerDialog(QDialog):
             "ui_state": {},
         }
         return gb, ctrl
-
-    def closeEvent(self, event):
+    def _close_extra_viewer(self):
         try:
             if hasattr(self.parent_widget, "viewer") and hasattr(self.parent_widget.viewer, "dims"):
                 self.parent_widget.viewer.dims.events.current_step.disconnect(self._on_parent_dims_changed)
         except Exception:
             pass
+
+        try:
+            if hasattr(self, "viewer") and self.viewer is not None:
+                self.viewer.close()
+        except Exception:
+            try:
+                self.viewer.window._qt_window.close()
+            except Exception:
+                pass
+
+
+    def closeEvent(self, event):
+        self._close_extra_viewer()
         super().closeEvent(event)
+
 
 ###############################################################################
 
@@ -1378,6 +1411,47 @@ class UIWidget(QWidget):
     def _update_aux_layers_for_z(self, v):
         v = int(v)
 
+        def _get_yx_transform(ref_layer):
+            yx_scale = (1.0, 1.0)
+            yx_translate = (0.0, 0.0)
+
+            if ref_layer is None:
+                return yx_scale, yx_translate
+
+            try:
+                raw_s = getattr(ref_layer, "scale", None)
+                if raw_s is not None:
+                    s = tuple(float(x) for x in raw_s)
+                    yx_scale = s[-2:] if len(s) >= 2 else (1.0, 1.0)
+            except Exception:
+                pass
+
+            try:
+                raw_t = getattr(ref_layer, "translate", None)
+                if raw_t is not None:
+                    t = tuple(float(x) for x in raw_t)
+                    yx_translate = t[-2:] if len(t) >= 2 else (0.0, 0.0)
+            except Exception:
+                pass
+
+            return yx_scale, yx_translate
+
+        def _apply_2d_transform(dst_layer, ref_layer):
+            if dst_layer is None or ref_layer is None:
+                return
+
+            yx_scale, yx_translate = _get_yx_transform(ref_layer)
+
+            try:
+                dst_layer.scale = yx_scale
+            except Exception:
+                pass
+
+            try:
+                dst_layer.translate = yx_translate
+            except Exception:
+                pass
+
         # ---------------------------------------------------------
         # DO NOT reslice the main channel image layers here.
         # Leave them as full 3D stacks so napari controls Z.
@@ -1393,7 +1467,6 @@ class UIWidget(QWidget):
                 if m3.ndim == 2:
                     m2 = (m3 > 0).astype(np.uint8)
                 else:
-                    # ---- FIX: skip stale masks whose Z count doesn't match current n_z ----
                     if m3.shape[0] != self.n_z:
                         continue
                     z = max(0, min(v, m3.shape[0] - 1))
@@ -1414,41 +1487,26 @@ class UIWidget(QWidget):
                     try:
                         lay.data = m2
                         lay.contrast_limits = (0, 1)
-                        # ---- FIX: keep mask scale/translate in sync with channel layer ----
-                        ch_layers = getattr(self, "channel_layers", [])
-                        if ch_idx < len(ch_layers):
-                            ref = ch_layers[ch_idx]
-                            raw_s = getattr(ref, "scale", None)
-                            raw_t = getattr(ref, "translate", None)
-                            if raw_s is not None:
-                                s = tuple(float(x) for x in raw_s)
-                                yx_s = s[-2:] if len(s) >= 2 else (1.0, 1.0)
-                                try:
-                                    lay.scale = yx_s
-                                except Exception:
-                                    pass
-                            if raw_t is not None:
-                                t = tuple(float(x) for x in raw_t)
-                                yx_t = t[-2:] if len(t) >= 2 else (0.0, 0.0)
-                                try:
-                                    lay.translate = yx_t
-                                except Exception:
-                                    pass
                     except Exception:
                         pass
+
+                    ch_layers = getattr(self, "channel_layers", [])
+                    ref = ch_layers[ch_idx] if ch_idx < len(ch_layers) else None
+                    _apply_2d_transform(lay, ref)
 
         # ---- derived (coloc/multiply) ----
         if hasattr(self, "derived_stacks"):
             self.derived_layers = getattr(self, "derived_layers", {})
+
             for k, arr3 in list(self.derived_stacks.items()):
                 lay = self.derived_layers.get(k, None)
                 if lay is None:
                     continue
 
                 arr3 = np.asarray(arr3)
+
                 try:
                     if arr3.ndim == 3:
-                        # ---- FIX: guard against stale derived stack with wrong n_z ----
                         if arr3.shape[0] != self.n_z:
                             continue
                         z = max(0, min(v, arr3.shape[0] - 1))
@@ -1458,10 +1516,52 @@ class UIWidget(QWidget):
                 except Exception:
                     pass
 
+                # ---- NEW: keep derived layer aligned to its reference layer ----
+                ref_name = None
+                mask_name = None
+
+                try:
+                    md = getattr(lay, "metadata", {}) or {}
+                    ref_name = (
+                        md.get("reference_layer_name")
+                        or md.get("source_target_layer_name")
+                        or md.get("target_layer_name")
+                    )
+                    mask_name = md.get("mask_layer_name")
+                except Exception:
+                    md = {}
+
+                # Fallback for older coloc layers that have no metadata
+                if not ref_name:
+                    try:
+                        nm = str(getattr(lay, "name", "") or "")
+                        m = re.match(r"^Mul\((.*?)\)_xMask\((.*?)\)$", nm)
+                        if m:
+                            ref_name = m.group(1).strip()
+                            mask_name = m.group(2).strip()
+                    except Exception:
+                        pass
+
+                ref_layer = None
+                if ref_name:
+                    ref_layer = self._get_layer_by_name(ref_name)
+
+                if ref_layer is None and mask_name:
+                    ref_layer = self._get_layer_by_name(mask_name)
+
+                _apply_2d_transform(lay, ref_layer)
+
+                try:
+                    if np.issubdtype(arr3.dtype, np.bool_) or self._is_mask_like(getattr(lay, "name", ""), arr3):
+                        lay.contrast_limits = (0, 1)
+                except Exception:
+                    pass
+
         # prune deleted coloc controls
         if hasattr(self, "coloc_controls"):
             alive = []
             alive_boxes = []
+
             for ctrl, box in zip(self.coloc_controls, getattr(self, "coloc_control_boxes", [])):
                 lay = ctrl.get("layer", None)
                 if lay is not None and lay in self.viewer.layers:
@@ -1472,6 +1572,7 @@ class UIWidget(QWidget):
                         box.setParent(None)
                     except Exception:
                         pass
+
             self.coloc_controls = alive
             self.coloc_control_boxes = alive_boxes
 
@@ -2969,10 +3070,11 @@ class UIWidget(QWidget):
 
             from qtpy.QtCore import Qt, QEventLoop
             from qtpy.QtWidgets import (
+                QApplication,
                 QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QMessageBox,
                 QDialog, QListWidget, QListWidgetItem, QDialogButtonBox,
                 QAbstractItemView, QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox,
-                QFileDialog, QScrollArea, QGroupBox, QInputDialog
+                QFileDialog, QScrollArea, QGroupBox, QInputDialog, QLineEdit, QGridLayout
             )
 
             from scipy import ndimage as ndi
@@ -2980,7 +3082,7 @@ class UIWidget(QWidget):
 
             from skimage.measure import marching_cubes
             from skimage.morphology import (
-                ball, binary_closing, binary_opening, binary_dilation, remove_small_objects
+                ball, binary_closing, binary_opening, remove_small_objects
             )
 
             # ============================================================
@@ -3001,6 +3103,53 @@ class UIWidget(QWidget):
                     return int(round(float(x)))
                 except Exception:
                     return int(default)
+
+            def _clean_float(x, default=""):
+                try:
+                    if x is None:
+                        return default
+                    if isinstance(x, str) and not x.strip():
+                        return default
+                    val = float(x)
+                    if np.isfinite(val):
+                        return val
+                    return default
+                except Exception:
+                    return default
+
+            def _infer_dataset_name():
+                candidates = []
+                for attr in (
+                    "filepath", "currentfilepath", "currentfile", "currentfilename",
+                    "loadedfilepath", "loadedfile", "lastloadedpath"
+                ):
+                    try:
+                        v = getattr(self, attr, None)
+                        if v:
+                            candidates.append(v)
+                    except Exception:
+                        pass
+
+                try:
+                    for lyr in self.viewer.layers:
+                        src = getattr(lyr, "source", None)
+                        path = getattr(src, "path", None) if src is not None else None
+                        if path:
+                            candidates.append(path)
+                except Exception:
+                    pass
+
+                if candidates:
+                    return _safe_stem(candidates[0])
+
+                try:
+                    names = [lyr.name for lyr in self.viewer.layers]
+                    if names:
+                        return _safe_stem(names[0])
+                except Exception:
+                    pass
+
+                return "puncta_dataset"
 
             def _suggest_voxel_size():
                 suggested = None
@@ -3109,14 +3258,12 @@ class UIWidget(QWidget):
                 if isinstance(cm, tuple) and len(cm) >= 2:
                     name = cm[0]
                     cmap_obj = cm[1]
-
                     if isinstance(name, str):
                         rgba = _hex_to_rgba(name)
                         if rgba is not None:
                             return rgba
                         if name.lower() in NAMED_RGBA:
                             return NAMED_RGBA[name.lower()]
-
                     try:
                         if hasattr(cmap_obj, "map"):
                             rgba = tuple(float(x) for x in cmap_obj.map([0.95])[0])
@@ -3165,11 +3312,6 @@ class UIWidget(QWidget):
             def _set_spacing(sp):
                 st = self._puncta_counter_state
                 st["spacing_um"] = (float(sp[0]), float(sp[1]), float(sp[2]))
-                for lyr in st.get("surface_layers", {}).values():
-                    try:
-                        pass
-                    except Exception:
-                        pass
                 for lyr in st.get("point_layers", {}).values():
                     try:
                         lyr.scale = st["spacing_um"]
@@ -3179,24 +3321,45 @@ class UIWidget(QWidget):
             def _ask_role_assignments(layer_names):
                 dlg = QDialog(self)
                 dlg.setWindowTitle("Puncta Counter: assign channel roles")
-                dlg.setMinimumWidth(520)
+                dlg.setMinimumWidth(700)
                 v = QVBoxLayout(dlg)
 
-                v.addWidget(QLabel("Assign channels to roles. Use 'None / N/A' for unused roles."))
+                v.addWidget(QLabel("Assign channels to roles and enter a display name for each used role."))
+
+                grid = QGridLayout()
+                grid.addWidget(QLabel("Role"), 0, 0)
+                grid.addWidget(QLabel("Channel"), 0, 1)
+                grid.addWidget(QLabel("Name"), 0, 2)
 
                 none_label = "None / N/A"
                 role_combos = {}
+                role_names = {}
 
-                for role in ["Cell of interest", "Protein 1", "Protein 2", "Protein 3"]:
-                    row = QHBoxLayout()
-                    row.addWidget(QLabel(role))
+                default_names = {
+                    "Cell of interest": "Cell",
+                    "Protein 1": "Protein 1",
+                    "Protein 2": "Protein 2",
+                    "Protein 3": "Protein 3",
+                }
+
+                roles = ["Cell of interest", "Protein 1", "Protein 2", "Protein 3"]
+                for row_idx, role in enumerate(roles, start=1):
+                    grid.addWidget(QLabel(role), row_idx, 0)
+
                     combo = QComboBox()
                     combo.addItem(none_label)
                     for nm in layer_names:
                         combo.addItem(nm)
-                    row.addWidget(combo)
-                    v.addLayout(row)
+                    grid.addWidget(combo, row_idx, 1)
                     role_combos[role] = combo
+
+                    line = QLineEdit()
+                    line.setText(default_names.get(role, role))
+                    line.setPlaceholderText(default_names.get(role, role))
+                    grid.addWidget(line, row_idx, 2)
+                    role_names[role] = line
+
+                v.addLayout(grid)
 
                 buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
                 buttons.accepted.connect(dlg.accept)
@@ -3207,20 +3370,38 @@ class UIWidget(QWidget):
                     return None
 
                 role_map = {}
-                for role, combo in role_combos.items():
-                    val = str(combo.currentText())
-                    role_map[role] = None if val == none_label else val
+                display_names = {}
+                used_channels = []
 
-                used = [x for x in role_map.values() if x is not None]
-                if not used:
+                for role in roles:
+                    ch = str(role_combos[role].currentText())
+                    ch = None if ch == none_label else ch
+                    role_map[role] = ch
+
+                    nm = str(role_names[role].text().strip())
+                    if not nm:
+                        nm = default_names.get(role, role)
+                    display_names[role] = nm
+
+                    if ch is not None:
+                        used_channels.append(ch)
+
+                if not used_channels:
                     QMessageBox.information(self, "Puncta Counter", "No channels were assigned.")
                     return None
 
-                if len(used) != len(set(used)):
+                if len(used_channels) != len(set(used_channels)):
                     QMessageBox.warning(self, "Puncta Counter", "Each role must use a different channel.")
                     return None
 
-                return role_map
+                if role_map.get("Cell of interest") is None:
+                    QMessageBox.warning(self, "Puncta Counter", "A Cell of interest channel is required.")
+                    return None
+
+                return {
+                    "role_map": role_map,
+                    "role_names": display_names,
+                }
 
             def _resolve_source_layer(name):
                 try:
@@ -3390,7 +3571,7 @@ class UIWidget(QWidget):
                 verts, faces, normals, values = marching_cubes(
                     work,
                     level=0.5,
-                    spacing=spacing,
+                    spacing=tuple(float(x) for x in spacing),
                     step_size=max(1, int(step_size)),
                 )
                 rgba = _rgba_from_layer_current(src_layer, fallback_name)
@@ -3406,6 +3587,48 @@ class UIWidget(QWidget):
                 del arr, work, normals
                 gc.collect()
                 return out
+
+            def _mesh_surface_area_um2(verts_zyx_um, faces):
+                if verts_zyx_um is None or faces is None or len(faces) == 0:
+                    return float("nan")
+                xyz = np.asarray(verts_zyx_um, dtype=np.float64)[:, [2, 1, 0]]
+                tri = xyz[np.asarray(faces, dtype=np.int64)]
+                a = tri[:, 1] - tri[:, 0]
+                b = tri[:, 2] - tri[:, 0]
+                return float(0.5 * np.linalg.norm(np.cross(a, b), axis=1).sum())
+
+            def _mesh_volume_um3(verts_zyx_um, faces):
+                if verts_zyx_um is None or faces is None or len(faces) == 0:
+                    return float("nan")
+                xyz = np.asarray(verts_zyx_um, dtype=np.float64)[:, [2, 1, 0]]
+                tri = xyz[np.asarray(faces, dtype=np.int64)]
+                vol = np.einsum("ij,ij->i", tri[:, 0], np.cross(tri[:, 1], tri[:, 2])).sum() / 6.0
+                return abs(float(vol))
+
+            def _mask_volume_um3(mask, spacing):
+                spacing = tuple(float(x) for x in spacing)
+                return float(np.count_nonzero(mask) * spacing[0] * spacing[1] * spacing[2])
+
+            def _component_surface_and_volume_um(local_mask, spacing):
+                local_mask = np.asarray(local_mask, dtype=bool)
+                vol_um3 = _mask_volume_um3(local_mask, spacing)
+                if not np.any(local_mask):
+                    return float("nan"), 0.0
+
+                padded = np.pad(local_mask.astype(np.uint8), 1)
+                try:
+                    surf = _surface_from_binary(
+                        padded,
+                        spacing=spacing,
+                        src_layer=None,
+                        fallback_name="punctum",
+                        sigma_px=0.0,
+                        step_size=1,
+                    )
+                    area_um2 = _mesh_surface_area_um2(surf["verts"], surf["faces"])
+                except Exception:
+                    area_um2 = float("nan")
+                return area_um2, vol_um3
 
             def _write_obj(obj_path, verts_zyx_um, faces):
                 verts_zyx_um = np.asarray(verts_zyx_um, dtype=float)
@@ -3563,7 +3786,7 @@ class UIWidget(QWidget):
                         counts[0] = 0
                         keep_id = int(np.argmax(counts))
                         mask = (lab == keep_id)
-                    del lab, counts
+                    del lab
                     gc.collect()
 
                 if bool(params.get("fill_holes", True)):
@@ -3571,7 +3794,7 @@ class UIWidget(QWidget):
 
                 return np.asarray(mask, dtype=bool)
 
-            def _prepare_cell_role(channel_name, spacing, params):
+            def _prepare_cell_role(channel_name, display_name, spacing, params):
                 vol = _get_3d_array(channel_name)
                 if vol is None:
                     raise RuntimeError(f"Could not resolve 3D data for {channel_name}")
@@ -3595,29 +3818,43 @@ class UIWidget(QWidget):
                 except Exception:
                     tree = None
 
+                cell_volume_um3 = _mask_volume_um3(clean_mask, spacing)
+                cell_surface_area_um2 = _mesh_surface_area_um2(surf["verts"], surf["faces"])
+                cell_mesh_volume_um3 = _mesh_volume_um3(surf["verts"], surf["faces"])
+
                 metadata = dict(params)
                 metadata["source_layer"] = str(channel_name)
+                metadata["display_name"] = str(display_name)
                 metadata["voxel_size_um"] = [float(spacing[0]), float(spacing[1]), float(spacing[2])]
+                metadata["cell_volume_um3"] = float(cell_volume_um3)
+                metadata["cell_surface_area_um2"] = float(cell_surface_area_um2)
+                metadata["cell_mesh_volume_um3"] = _clean_float(cell_mesh_volume_um3)
 
                 result = {
                     "role": "Cell of interest",
+                    "display_name": str(display_name),
                     "kind": "cell",
                     "channel": channel_name,
                     "surface": surf,
                     "clean_mask": clean_mask,
                     "surface_tree": tree,
                     "metadata": metadata,
+                    "cell_volume_um3": float(cell_volume_um3),
+                    "cell_surface_area_um2": float(cell_surface_area_um2),
+                    "cell_mesh_volume_um3": _clean_float(cell_mesh_volume_um3),
                 }
 
                 gc.collect()
                 return result
 
-            def _prepare_protein_role(role_label, channel_name, spacing, params):
+            def _prepare_protein_role(role_label, channel_name, display_name, spacing, params):
                 vol = _get_3d_array(channel_name)
                 if vol is None:
                     raise RuntimeError(f"Could not resolve 3D data for {channel_name}")
 
                 protein_mask = np.asarray(vol) > 0
+                if protein_mask.ndim != 3:
+                    raise ValueError(f"{role_label}: resolved data is not 3D.")
                 if not np.any(protein_mask):
                     raise ValueError(f"{role_label}: no positive voxels found.")
 
@@ -3631,12 +3868,28 @@ class UIWidget(QWidget):
                     step_size=int(params.get("marching_cubes_step_size", 1)),
                 )
 
+                protein_mask_volume_um3 = _mask_volume_um3(protein_mask, spacing)
+                protein_surface_area_um2 = _mesh_surface_area_um2(surf["verts"], surf["faces"])
+                protein_mesh_volume_um3 = _mesh_volume_um3(surf["verts"], surf["faces"])
+
+                metadata = dict(params)
+                metadata["source_layer"] = str(channel_name)
+                metadata["display_name"] = str(display_name)
+                metadata["voxel_size_um"] = [float(spacing[0]), float(spacing[1]), float(spacing[2])]
+                metadata["protein_mask_volume_um3"] = float(protein_mask_volume_um3)
+                metadata["protein_surface_area_um2"] = _clean_float(protein_surface_area_um2)
+                metadata["protein_mesh_volume_um3"] = _clean_float(protein_mesh_volume_um3)
+
                 result = {
                     "role": role_label,
+                    "display_name": str(display_name),
                     "kind": "protein",
                     "channel": channel_name,
                     "surface": surf,
-                    "metadata": dict(params),
+                    "metadata": metadata,
+                    "protein_mask_volume_um3": float(protein_mask_volume_um3),
+                    "protein_surface_area_um2": _clean_float(protein_surface_area_um2),
+                    "protein_mesh_volume_um3": _clean_float(protein_mesh_volume_um3),
                 }
 
                 del protein_mask
@@ -3657,11 +3910,31 @@ class UIWidget(QWidget):
 
                 ctrl = QDialog(self)
                 ctrl.setWindowTitle(f"{role_label} preview decision")
-                ctrl.setMinimumWidth(420)
+                ctrl.setMinimumWidth(500)
                 cv = QVBoxLayout(ctrl)
+
+                summary_lines = [
+                    f"Role: {role_label}",
+                    f"Name: {result_obj.get('display_name', role_label)}",
+                    f"Channel: {result_obj['channel']}",
+                    f"Vertices: {len(surf['verts'])}",
+                    f"Faces: {len(surf['faces'])}",
+                ]
+                if result_obj["kind"] == "cell":
+                    summary_lines.append(f"Cell volume (mask, um^3): {float(result_obj['cell_volume_um3']):.6f}")
+                    summary_lines.append(f"Cell surface area (mesh, um^2): {float(result_obj['cell_surface_area_um2']):.6f}")
+                else:
+                    summary_lines.append(
+                        f"Protein mask volume (um^3): {float(result_obj.get('protein_mask_volume_um3', 0.0)):.6f}"
+                    )
+                    psa = result_obj.get("protein_surface_area_um2", "")
+                    if psa != "":
+                        summary_lines.append(f"Protein surface area (mesh, um^2): {float(psa):.6f}")
+
+                cv.addWidget(QLabel("\n".join(summary_lines)))
                 cv.addWidget(QLabel(
                     f"Inspect the preview viewer for {role_label}.\n"
-                    f"Accept = use this mesh in the final analysis viewer.\n"
+                    f"Accept = use this mesh.\n"
                     f"Rerun = close preview and choose new parameters."
                 ))
 
@@ -3707,7 +3980,7 @@ class UIWidget(QWidget):
                 gc.collect()
                 return decision["value"]
 
-            def _run_role_preview(role_label, channel_name, spacing, is_cell=False):
+            def _run_role_preview(role_label, channel_name, display_name, spacing, is_cell=False):
                 if is_cell:
                     params = _default_cell_params(channel_name, spacing)
                     ask_load = QMessageBox.question(
@@ -3740,9 +4013,9 @@ class UIWidget(QWidget):
 
                     try:
                         if is_cell:
-                            result = _prepare_cell_role(channel_name, spacing, params)
+                            result = _prepare_cell_role(channel_name, display_name, spacing, params)
                         else:
-                            result = _prepare_protein_role(role_label, channel_name, spacing, params)
+                            result = _prepare_protein_role(role_label, channel_name, display_name, spacing, params)
                     except Exception as e:
                         QMessageBox.critical(
                             self,
@@ -3786,9 +4059,13 @@ class UIWidget(QWidget):
                 return
             _warn_if_spacing_looks_swapped(spacing0)
 
-            role_map = _ask_role_assignments(layer_names)
-            if role_map is None:
+            assignment = _ask_role_assignments(layer_names)
+            if assignment is None:
                 return
+
+            role_map = dict(assignment["role_map"])
+            role_names = dict(assignment["role_names"])
+            dataset_name = _infer_dataset_name()
 
             selected_channels = _get_channel_list_from_role_map(role_map)
             available_channels = []
@@ -3800,11 +4077,11 @@ class UIWidget(QWidget):
                 else:
                     available_channels.append(nm)
 
-            if not available_channels:
+            if role_map.get("Cell of interest") not in available_channels:
                 QMessageBox.warning(
                     self,
                     "Puncta Counter",
-                    "No valid 3D channels could be resolved for the assigned roles."
+                    "The assigned Cell of interest channel could not be resolved as a 3D volume."
                 )
                 return
 
@@ -3824,10 +4101,13 @@ class UIWidget(QWidget):
                 if ch is None or ch not in available_channels:
                     continue
 
+                display_name = str(role_names.get(role, role)).strip() or role
+
                 try:
                     res = _run_role_preview(
                         role_label=role,
                         channel_name=ch,
+                        display_name=display_name,
                         spacing=spacing0,
                         is_cell=(role == "Cell of interest"),
                     )
@@ -3836,6 +4116,9 @@ class UIWidget(QWidget):
                     res = None
 
                 if res is None:
+                    if role == "Cell of interest":
+                        QMessageBox.warning(self, "Puncta Counter", "A cell-of-interest mesh is required.")
+                        return
                     skip = QMessageBox.question(
                         self,
                         "Skip role",
@@ -3849,8 +4132,8 @@ class UIWidget(QWidget):
 
                 accepted_roles[role] = res
 
-            if not accepted_roles:
-                QMessageBox.information(self, "Puncta Counter", "No channels were accepted for the final viewer.")
+            if "Cell of interest" not in accepted_roles:
+                QMessageBox.warning(self, "Puncta Counter", "No Cell of interest mesh was accepted.")
                 return
 
             # ============================================================
@@ -3865,13 +4148,16 @@ class UIWidget(QWidget):
 
             self._puncta_counter_state = {
                 "viewer": pc,
+                "dataset_name": str(dataset_name),
                 "spacing_um": tuple(spacing0),
                 "role_map": dict(role_map),
+                "role_names": dict(role_names),
                 "accepted_roles": accepted_roles,
                 "surface_layers": {},
                 "point_layers": {},
                 "analysis_cache": {},
                 "cell_channel_name": cell_result["channel"] if cell_result is not None else "",
+                "cell_display_name": cell_result.get("display_name", "Cell") if cell_result is not None else "Cell",
                 "cell_mask": cell_result["clean_mask"] if cell_result is not None else None,
                 "cell_bbox": _mask_bbox(cell_result["clean_mask"]) if cell_result is not None else None,
                 "cell_mesh_verts_zyx_um": None if cell_result is None else np.asarray(cell_result["surface"]["verts"], dtype=np.float32),
@@ -3879,84 +4165,105 @@ class UIWidget(QWidget):
                 "cell_surface_tree": None if cell_result is None else cell_result.get("surface_tree", None),
                 "cell_mesh_metadata": {} if cell_result is None else dict(cell_result.get("metadata", {})),
                 "cell_mesh_metadata_path": "",
+                "cell_volume_um3": 0.0 if cell_result is None else float(cell_result.get("cell_volume_um3", 0.0)),
+                "cell_surface_area_um2": "" if cell_result is None else _clean_float(cell_result.get("cell_surface_area_um2", "")),
+                "cell_mesh_volume_um3": "" if cell_result is None else _clean_float(cell_result.get("cell_mesh_volume_um3", "")),
                 "protein_channels": list(protein_channels),
             }
             st = self._puncta_counter_state
 
-            def _upsert_surface_layer(layer_name, surf_dict, shading="smooth", visible=True):
-                if surf_dict is None:
-                    return None
-                verts = np.asarray(surf_dict["verts"], dtype=np.float32)
-                faces = np.asarray(surf_dict["faces"], dtype=np.int32)
-                values = np.asarray(surf_dict["values"], dtype=np.float32)
-                vertex_colors = np.asarray(surf_dict["vertex_colors"], dtype=np.float32)
+            def _upsert_points_layer(layer_name, points_zyx_um, face_color="yellow", edge_color="black", size=6, visible=True):
+                pts = np.asarray(points_zyx_um, dtype=np.float32)
+                if pts.size == 0:
+                    pts = np.zeros((0, 3), dtype=np.float32)
 
-                existing = st["surface_layers"].get(layer_name, None)
-                if existing is None:
-                    lyr = pc.add_surface(
-                        (verts, faces, values),
-                        name=layer_name,
-                        shading=shading,
-                        vertex_colors=vertex_colors,
-                    )
+                existing = st["point_layers"].get(layer_name, None)
+
+                def _style_points_layer(lyr):
+                    try:
+                        lyr.scale = (1.0, 1.0, 1.0)
+                    except Exception:
+                        pass
+                    try:
+                        lyr.face_color = face_color
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(lyr, "border_color"):
+                            lyr.border_color = edge_color
+                        elif hasattr(lyr, "edge_color"):
+                            lyr.edge_color = edge_color
+                    except Exception:
+                        pass
+                    try:
+                        lyr.size = size
+                    except Exception:
+                        pass
                     try:
                         lyr.visible = visible
                     except Exception:
                         pass
-                    st["surface_layers"][layer_name] = lyr
+
+                if existing is None:
+                    lyr = pc.add_points(
+                        pts,
+                        name=layer_name,
+                        ndim=3,
+                        scale=(1.0, 1.0, 1.0),
+                        face_color=face_color,
+                        size=size,
+                        visible=visible,
+                    )
+                    _style_points_layer(lyr)
+                    st["point_layers"][layer_name] = lyr
                     return lyr
 
                 try:
-                    existing.data = (verts, faces, values)
-                    existing.vertex_colors = vertex_colors
-                    existing.visible = visible
+                    existing.data = pts
+                    _style_points_layer(existing)
                     return existing
                 except Exception:
                     try:
                         pc.layers.remove(existing)
                     except Exception:
                         pass
-                    lyr = pc.add_surface(
-                        (verts, faces, values),
-                        name=layer_name,
-                        shading=shading,
-                        vertex_colors=vertex_colors,
-                    )
-                    try:
-                        lyr.visible = visible
-                    except Exception:
-                        pass
-                    st["surface_layers"][layer_name] = lyr
-                    return lyr
 
-        
-
-            for role in ordered_roles:
-                if role not in accepted_roles:
-                    continue
-                res = accepted_roles[role]
-                ch = res["channel"]
-                _upsert_surface_layer(
-                    f"{role} surface - {ch}",
-                    res["surface"],
-                    shading="smooth",
-                    visible=True
+                lyr = pc.add_points(
+                    pts,
+                    name=layer_name,
+                    ndim=3,
+                    scale=(1.0, 1.0, 1.0),
+                    face_color=face_color,
+                    size=size,
+                    visible=visible,
                 )
+                _style_points_layer(lyr)
+                st["point_layers"][layer_name] = lyr
+                return lyr
+
 
             # ============================================================
             # Analysis helpers
             # ============================================================
             def _current_cell_metadata_payload():
                 payload = dict(st.get("cell_mesh_metadata", {}) or {})
+                payload["dataset_name"] = str(st.get("dataset_name", ""))
                 payload["source_layer"] = str(st.get("cell_channel_name", ""))
+                payload["cell_name"] = str(st.get("cell_display_name", "Cell"))
                 payload["voxel_size_um"] = [float(x) for x in _current_spacing()]
+                payload["cell_volume_um3"] = _clean_float(st.get("cell_volume_um3", ""))
+                payload["cell_surface_area_um2"] = _clean_float(st.get("cell_surface_area_um2", ""))
+                payload["cell_mesh_volume_um3"] = _clean_float(st.get("cell_mesh_volume_um3", ""))
                 return payload
 
             def _save_cell_metadata_dialog():
                 if st.get("cell_mask", None) is None:
                     QMessageBox.warning(self, "Save metadata", "No cell-of-interest mesh exists.")
                     return
-                default_name = f"{_safe_stem(st.get('cell_channel_name', 'cell_of_interest'))}_cell_of_interest_mesh.json"
+                default_name = (
+                    f"{_safe_stem(st.get('dataset_name', 'dataset'))}_"
+                    f"{_safe_stem(st.get('cell_display_name', 'cell'))}_cell_of_interest_mesh.json"
+                )
                 save_path = _save_cell_metadata_file(_current_cell_metadata_payload(), default_name)
                 if save_path:
                     st["cell_mesh_metadata_path"] = save_path
@@ -3970,8 +4277,8 @@ class UIWidget(QWidget):
                     QMessageBox.warning(self, "Export cell mesh", "No cell mesh exists yet.")
                     return
 
-                cell_nm = str(st.get("cell_channel_name", "cell_of_interest"))
-                suggested = f"{_safe_stem(cell_nm)}_cell_of_interest.obj"
+                cell_nm = str(st.get("cell_display_name", "cell_of_interest"))
+                suggested = f"{_safe_stem(st.get('dataset_name', 'dataset'))}_{_safe_stem(cell_nm)}_cell_of_interest.obj"
                 obj_path, _ = QFileDialog.getSaveFileName(
                     self,
                     "Export cell mesh OBJ",
@@ -4004,6 +4311,74 @@ class UIWidget(QWidget):
                 except Exception as e:
                     QMessageBox.critical(self, "Export cell mesh", f"Failed to export OBJ:\n{e}")
 
+            def _export_all_accepted_meshes():
+                if not accepted_roles:
+                    QMessageBox.warning(self, "Export meshes", "No accepted meshes are available.")
+                    return
+
+                out_dir = QFileDialog.getExistingDirectory(self, "Choose output folder for mesh export")
+                if not out_dir:
+                    return
+
+                root = Path(out_dir) / _safe_stem(st.get("dataset_name", "puncta_dataset"))
+                mesh_dir = root / "meshes"
+                mesh_dir.mkdir(parents=True, exist_ok=True)
+
+                written = []
+                try:
+                    for role in ordered_roles:
+                        if role not in accepted_roles:
+                            continue
+
+                        res = accepted_roles[role]
+                        role_slug = _safe_stem(role.lower().replace(" ", "_"))
+                        name_slug = _safe_stem(res.get("display_name", role))
+                        ch_slug = _safe_stem(res["channel"])
+
+                        obj_path = mesh_dir / f"{role_slug}__{name_slug}__{ch_slug}.obj"
+                        json_path = obj_path.with_suffix(".json")
+
+                        _write_obj(obj_path, res["surface"]["verts"], res["surface"]["faces"])
+
+                        meta = dict(res.get("metadata", {}))
+                        meta["dataset_name"] = str(st.get("dataset_name", ""))
+                        meta["role"] = str(role)
+                        meta["display_name"] = str(res.get("display_name", role))
+                        meta["channel"] = str(res["channel"])
+                        meta["obj_file"] = str(obj_path.name)
+                        meta["vertex_count"] = int(len(res["surface"]["verts"]))
+                        meta["face_count"] = int(len(res["surface"]["faces"]))
+                        meta["mesh_surface_area_um2"] = _clean_float(
+                            _mesh_surface_area_um2(res["surface"]["verts"], res["surface"]["faces"])
+                        )
+                        meta["mesh_volume_um3"] = _clean_float(
+                            _mesh_volume_um3(res["surface"]["verts"], res["surface"]["faces"])
+                        )
+
+                        if role == "Cell of interest":
+                            meta["cell_volume_um3"] = _clean_float(res.get("cell_volume_um3", ""))
+                            meta["cell_surface_area_um2"] = _clean_float(res.get("cell_surface_area_um2", ""))
+                            meta["cell_mesh_volume_um3"] = _clean_float(res.get("cell_mesh_volume_um3", ""))
+
+                        if role.startswith("Protein"):
+                            meta["protein_mask_volume_um3"] = _clean_float(res.get("protein_mask_volume_um3", ""))
+                            meta["protein_surface_area_um2"] = _clean_float(res.get("protein_surface_area_um2", ""))
+                            meta["protein_mesh_volume_um3"] = _clean_float(res.get("protein_mesh_volume_um3", ""))
+
+                        with open(json_path, "w", encoding="utf-8") as f:
+                            json.dump(meta, f, indent=2)
+
+                        written.append(obj_path.name)
+
+                    QMessageBox.information(
+                        self,
+                        "Export meshes",
+                        f"Exported {len(written)} mesh OBJ/JSON pairs to:\n{mesh_dir}"
+                    )
+                    _update_status(f"Exported accepted meshes to: {mesh_dir}")
+                except Exception as e:
+                    QMessageBox.critical(self, "Export meshes", f"Failed to export meshes:\n{e}")
+
             def _get_selected_protein_channels():
                 out = []
                 for i in range(protein_channel_list.count()):
@@ -4016,24 +4391,36 @@ class UIWidget(QWidget):
 
             def _sync_localization_combos():
                 selected = _get_selected_protein_channels()
-                cur_a = str(loc_ch_a.currentText()) if loc_ch_a.count() else ""
-                cur_b = str(loc_ch_b.currentText()) if loc_ch_b.count() else ""
+                current_items = {str(loc_ch_a.currentText()), str(loc_ch_b.currentText())}
 
                 loc_ch_a.blockSignals(True)
                 loc_ch_b.blockSignals(True)
-
                 loc_ch_a.clear()
                 loc_ch_b.clear()
-                for nm in selected:
-                    loc_ch_a.addItem(nm)
-                    loc_ch_b.addItem(nm)
 
-                if cur_a in selected:
-                    loc_ch_a.setCurrentText(cur_a)
-                if cur_b in selected:
-                    loc_ch_b.setCurrentText(cur_b)
-                elif len(selected) >= 2:
+                for ch in selected:
+                    role = _channel_role_name(ch)
+                    nm = _channel_display_name(ch)
+                    label = f"{role} | {nm} | {ch}"
+                    loc_ch_a.addItem(label, ch)
+                    loc_ch_b.addItem(label, ch)
+
+                for idx in range(loc_ch_a.count()):
+                    if loc_ch_a.itemData(idx) in current_items:
+                        loc_ch_a.setCurrentIndex(idx)
+                        break
+
+                for idx in range(loc_ch_b.count()):
+                    if loc_ch_b.itemData(idx) in current_items:
+                        loc_ch_b.setCurrentIndex(idx)
+                        break
+
+                if loc_ch_a.count() >= 1 and loc_ch_a.currentIndex() < 0:
+                    loc_ch_a.setCurrentIndex(0)
+                if loc_ch_b.count() >= 2 and loc_ch_b.currentIndex() < 0:
                     loc_ch_b.setCurrentIndex(1)
+                elif loc_ch_b.count() >= 1 and loc_ch_b.currentIndex() < 0:
+                    loc_ch_b.setCurrentIndex(0)
 
                 loc_ch_a.blockSignals(False)
                 loc_ch_b.blockSignals(False)
@@ -4070,6 +4457,12 @@ class UIWidget(QWidget):
                         return role
                 return ""
 
+            def _channel_display_name(ch):
+                for role, obj in accepted_roles.items():
+                    if obj["channel"] == ch:
+                        return str(obj.get("display_name", role))
+                return str(ch)
+
             def _prepare_roi_binary(channel_name, threshold_value, shell_um):
                 vol = _get_3d_array(channel_name)
                 if vol is None:
@@ -4087,7 +4480,6 @@ class UIWidget(QWidget):
 
                 vol_crop = np.asarray(vol[slc])
                 cell_crop = np.asarray(cell_mask[slc], dtype=bool)
-
                 thr = float(threshold_value)
                 binary_crop = np.asarray(vol_crop > thr, dtype=bool)
 
@@ -4126,9 +4518,20 @@ class UIWidget(QWidget):
 
                 if not np.any(binary_crop):
                     if add_layers:
-                        _upsert_points_layer(displayed_layer_name, np.zeros((0, 3)), face_color="cyan", size=6, visible=True)
-                        _upsert_points_layer(all_layer_name, np.zeros((0, 3)), face_color="yellow", size=5, visible=False)
-
+                        _upsert_points_layer(
+                            displayed_layer_name,
+                            np.zeros((0, 3)),
+                            face_color="cyan",
+                            size=6,
+                            visible=True,
+                        )
+                        _upsert_points_layer(
+                            all_layer_name,
+                            np.zeros((0, 3)),
+                            face_color="yellow",
+                            size=5,
+                            visible=False,
+                        )
                     del binary_crop, cell_crop, vol_crop
                     gc.collect()
                     return {
@@ -4139,7 +4542,7 @@ class UIWidget(QWidget):
                             "inside": 0,
                             "shell_only": 0,
                             "displayed": 0,
-                        }
+                        },
                     }
 
                 lbl, _ = ndi.label(binary_crop)
@@ -4158,7 +4561,8 @@ class UIWidget(QWidget):
                 n_displayed = 0
 
                 base_z, _, base_y, _, base_x, _ = crop_bbox
-                sp = np.array(_current_spacing(), dtype=np.float32)
+                sp = np.array(_current_spacing(), dtype=np.float64)
+                voxel_volume_um3 = float(sp[0] * sp[1] * sp[2])
 
                 for puncta_id, slc in enumerate(objs, start=1):
                     if slc is None:
@@ -4176,8 +4580,9 @@ class UIWidget(QWidget):
                     crop_coords = local_coords + np.array([[z0, y0, x0]], dtype=np.int32)
                     global_coords = crop_coords + np.array([[base_z, base_y, base_x]], dtype=np.int32)
 
-                    pixel_count = int(global_coords.shape[0])
-                    centroid_pix = global_coords.mean(axis=0).astype(np.float32)
+                    voxel_count = int(global_coords.shape[0])
+                    pixel_count = int(voxel_count)
+                    centroid_pix = global_coords.mean(axis=0).astype(np.float64)
                     centroid_phys_zyx = centroid_pix * sp
 
                     intens_vals = vol_crop[
@@ -4185,9 +4590,8 @@ class UIWidget(QWidget):
                         crop_coords[:, 1],
                         crop_coords[:, 2]
                     ]
-
-                    mean_intensity = _round_int(np.mean(intens_vals)) if intens_vals.size else 0
-                    max_intensity = _round_int(np.max(intens_vals)) if intens_vals.size else 0
+                    mean_intensity = float(np.mean(intens_vals)) if intens_vals.size else 0.0
+                    max_intensity = float(np.max(intens_vals)) if intens_vals.size else 0.0
 
                     cell_overlap_vals = cell_mask[
                         global_coords[:, 0],
@@ -4214,6 +4618,9 @@ class UIWidget(QWidget):
                     else:
                         classification = "outside"
 
+                    puncta_surface_area_um2 = ""
+                    puncta_volume_um3 = float(voxel_count * voxel_volume_um3)
+
                     if keep_flag:
                         n_total += 1
                         if inside_flag:
@@ -4224,18 +4631,30 @@ class UIWidget(QWidget):
                             n_displayed += 1
 
                         row = {
-                            "channel": channel_name,
-                            "role": _channel_role_name(channel_name),
+                            "dataset_name": str(st.get("dataset_name", "")),
+                            "cell_channel": str(st.get("cell_channel_name", "")),
+                            "cell_name": str(st.get("cell_display_name", "Cell")),
+                            "cell_volume_um3": _clean_float(st.get("cell_volume_um3", "")),
+                            "cell_surface_area_um2": _clean_float(st.get("cell_surface_area_um2", "")),
+                            "protein_role": str(_channel_role_name(channel_name)),
+                            "protein_name": str(_channel_display_name(channel_name)),
+                            "puncta_channel": str(channel_name),
                             "puncta_id": int(puncta_id),
                             "pixel_count": int(pixel_count),
-                            "mean_intensity": int(mean_intensity),
-                            "max_intensity": int(max_intensity),
-                            "centroid_z_um": _round_int(centroid_phys_zyx[0]),
-                            "centroid_y_um": _round_int(centroid_phys_zyx[1]),
-                            "centroid_x_um": _round_int(centroid_phys_zyx[2]),
+                            "voxel_count": int(voxel_count),
+                            "mean_intensity": float(mean_intensity),
+                            "max_intensity": float(max_intensity),
+                            "surface_area_um2": _clean_float(puncta_surface_area_um2),
+                            "puncta_volume_um3": _clean_float(puncta_volume_um3),
+                            "centroid_z_pix": float(centroid_pix[0]),
+                            "centroid_y_pix": float(centroid_pix[1]),
+                            "centroid_x_pix": float(centroid_pix[2]),
+                            "centroid_z_um": float(centroid_phys_zyx[0]),
+                            "centroid_y_um": float(centroid_phys_zyx[1]),
+                            "centroid_x_um": float(centroid_phys_zyx[2]),
                             "centroid_inside_cell_flag": bool(centroid_in),
-                            "overlap_fraction_in_cell_pct": _round_int(overlap_frac * 100.0),
-                            "surface_distance_um": "" if not np.isfinite(surface_dist_um) else _round_int(surface_dist_um),
+                            "overlap_fraction_in_cell_pct": float(overlap_frac * 100.0),
+                            "surface_distance_um": "" if not np.isfinite(surface_dist_um) else float(surface_dist_um),
                             "inside_mesh_flag": bool(inside_flag),
                             "within_surface_threshold_flag": bool(near_surface_flag),
                             "display_threshold_pass_flag": bool(pixel_count >= display_min_px),
@@ -4250,9 +4669,10 @@ class UIWidget(QWidget):
                             row["_coords_set"] = set(map(tuple, np.asarray(global_coords, dtype=np.int32)))
 
                         rows.append(row)
-                        all_points.append(centroid_pix)
+                        all_points.append(np.asarray(centroid_phys_zyx, dtype=np.float32))
                         if display_flag:
-                            displayed_points.append(centroid_pix)
+                            displayed_points.append(np.asarray(centroid_phys_zyx, dtype=np.float32))
+
 
                     del local_mask, local_coords, crop_coords, global_coords, cell_overlap_vals, intens_vals
 
@@ -4286,9 +4706,12 @@ class UIWidget(QWidget):
                     }
                 }
 
+
             def _clear_analysis_cache():
                 st["analysis_cache"] = {}
                 gc.collect()
+                QMessageBox.information(self, "Puncta Counter", "Analysis cache cleared.")
+                _update_status("Analysis cache cleared")
 
             def _remove_named_layer(layer_name, store_key=None):
                 lyr = None
@@ -4380,7 +4803,6 @@ class UIWidget(QWidget):
                     st["point_layers"][layer_name] = lyr
                     return lyr
 
-
             def _restrict_selected_puncta():
                 selected = _get_selected_protein_channels()
                 if not selected:
@@ -4412,7 +4834,7 @@ class UIWidget(QWidget):
                         }
                         s = res["summary"]
                         summaries.append(
-                            f"{ch}: kept={s['total']}, inside={s['inside']}, shell_only={s['shell_only']}, displayed={s['displayed']}"
+                            f"{_channel_display_name(ch)} ({ch}): kept={s['total']}, inside={s['inside']}, shell_only={s['shell_only']}, displayed={s['displayed']}"
                         )
                     except Exception as e:
                         summaries.append(f"{ch}: failed ({e})")
@@ -4428,7 +4850,6 @@ class UIWidget(QWidget):
                     "Restrict puncta",
                     "Restriction complete.\n\n" + "\n".join(summaries)
                 )
-
 
             def _prompt_export_threshold_choice():
                 reply = QMessageBox.question(
@@ -4459,7 +4880,10 @@ class UIWidget(QWidget):
                 if include_below_threshold is None:
                     return
 
-                default_name = f"{_safe_stem(str(st.get('cell_channel_name', 'puncta')))}_puncta_measurements.csv"
+                default_name = (
+                    f"{_safe_stem(str(st.get('dataset_name', 'dataset')))}_"
+                    f"{_safe_stem(str(st.get('cell_display_name', 'cell')))}_puncta_measurements.csv"
+                )
                 save_path, _ = QFileDialog.getSaveFileName(
                     self,
                     "Save puncta CSV",
@@ -4472,13 +4896,24 @@ class UIWidget(QWidget):
                     save_path = str(save_path) + ".csv"
 
                 fieldnames = [
+                    "dataset_name",
                     "cell_channel",
+                    "cell_name",
+                    "cell_volume_um3",
+                    "cell_surface_area_um2",
                     "protein_role",
+                    "protein_name",
                     "puncta_channel",
                     "puncta_id",
                     "pixel_count",
+                    "voxel_count",
                     "mean_intensity",
                     "max_intensity",
+                    "surface_area_um2",
+                    "puncta_volume_um3",
+                    "centroid_x_pix",
+                    "centroid_y_pix",
+                    "centroid_z_pix",
                     "centroid_x_um",
                     "centroid_y_um",
                     "centroid_z_um",
@@ -4517,19 +4952,30 @@ class UIWidget(QWidget):
                                     continue
 
                                 writer.writerow({
-                                    "cell_channel": str(st.get("cell_channel_name", "")),
-                                    "protein_role": str(r["role"]),
-                                    "puncta_channel": str(r["channel"]),
+                                    "dataset_name": str(r["dataset_name"]),
+                                    "cell_channel": str(r["cell_channel"]),
+                                    "cell_name": str(r["cell_name"]),
+                                    "cell_volume_um3": _clean_float(r["cell_volume_um3"]),
+                                    "cell_surface_area_um2": _clean_float(r["cell_surface_area_um2"]),
+                                    "protein_role": str(r["protein_role"]),
+                                    "protein_name": str(r["protein_name"]),
+                                    "puncta_channel": str(r["puncta_channel"]),
                                     "puncta_id": int(r["puncta_id"]),
                                     "pixel_count": int(r["pixel_count"]),
-                                    "mean_intensity": int(r["mean_intensity"]),
-                                    "max_intensity": int(r["max_intensity"]),
-                                    "centroid_x_um": int(r["centroid_x_um"]),
-                                    "centroid_y_um": int(r["centroid_y_um"]),
-                                    "centroid_z_um": int(r["centroid_z_um"]),
+                                    "voxel_count": int(r["voxel_count"]),
+                                    "mean_intensity": _clean_float(r["mean_intensity"], 0.0),
+                                    "max_intensity": _clean_float(r["max_intensity"], 0.0),
+                                    "surface_area_um2": _clean_float(r["surface_area_um2"]),
+                                    "puncta_volume_um3": _clean_float(r["puncta_volume_um3"]),
+                                    "centroid_x_pix": _clean_float(r["centroid_x_pix"], 0.0),
+                                    "centroid_y_pix": _clean_float(r["centroid_y_pix"], 0.0),
+                                    "centroid_z_pix": _clean_float(r["centroid_z_pix"], 0.0),
+                                    "centroid_x_um": _clean_float(r["centroid_x_um"], 0.0),
+                                    "centroid_y_um": _clean_float(r["centroid_y_um"], 0.0),
+                                    "centroid_z_um": _clean_float(r["centroid_z_um"], 0.0),
                                     "centroid_inside_cell_flag": bool(r["centroid_inside_cell_flag"]),
-                                    "overlap_fraction_in_cell_pct": int(r["overlap_fraction_in_cell_pct"]),
-                                    "surface_distance_um": r["surface_distance_um"],
+                                    "overlap_fraction_in_cell_pct": _clean_float(r["overlap_fraction_in_cell_pct"], 0.0),
+                                    "surface_distance_um": _clean_float(r["surface_distance_um"]),
                                     "inside_mesh_flag": bool(r["inside_mesh_flag"]),
                                     "within_surface_threshold_flag": bool(r["within_surface_threshold_flag"]),
                                     "display_threshold_pass_flag": bool(r["display_threshold_pass_flag"]),
@@ -4543,7 +4989,7 @@ class UIWidget(QWidget):
                                     shell_only += 1
 
                             summary_lines.append(
-                                f"{ch}: exported={exported}, inside={inside}, shell_only={shell_only}"
+                                f"{_channel_display_name(ch)} ({ch}): exported={exported}, inside={inside}, shell_only={shell_only}"
                             )
 
                     st["analysis_cache"] = cache
@@ -4582,9 +5028,16 @@ class UIWidget(QWidget):
                 st["analysis_cache"] = cache
                 return cache[channel_name]
 
+            def _selected_localization_channel(combo):
+                idx = combo.currentIndex()
+                if idx < 0:
+                    return ""
+                val = combo.itemData(idx)
+                return str(val) if val else ""
+
             def _localize_selected_channels():
-                ch_a = str(loc_ch_a.currentText())
-                ch_b = str(loc_ch_b.currentText())
+                ch_a = _selected_localization_channel(loc_ch_a)
+                ch_b = _selected_localization_channel(loc_ch_b)
 
                 if not ch_a or not ch_b:
                     QMessageBox.warning(self, "Localization", "Select two protein channels.")
@@ -4644,25 +5097,40 @@ class UIWidget(QWidget):
                         rb = rows_b[ib]
 
                         matched_rows.append({
+                            "dataset_name": str(st.get("dataset_name", "")),
+                            "cell_channel": str(st.get("cell_channel_name", "")),
+                            "cell_name": str(st.get("cell_display_name", "Cell")),
+                            "cell_volume_um3": _clean_float(st.get("cell_volume_um3", "")),
+                            "cell_surface_area_um2": _clean_float(st.get("cell_surface_area_um2", "")),
                             "channel_a": ch_a,
+                            "protein_role_a": str(ra["protein_role"]),
+                            "protein_name_a": str(ra["protein_name"]),
                             "channel_b": ch_b,
+                            "protein_role_b": str(rb["protein_role"]),
+                            "protein_name_b": str(rb["protein_name"]),
                             "puncta_id_a": int(ra["puncta_id"]),
                             "puncta_id_b": int(rb["puncta_id"]),
                             "match_mode": "centroid_distance",
-                            "centroid_distance_um": _round_int(dist_um),
+                            "centroid_distance_um": _clean_float(dist_um),
                             "voxel_overlap_fraction_min_object_pct": "",
                             "pixel_count_a": int(ra["pixel_count"]),
+                            "voxel_count_a": int(ra["voxel_count"]),
+                            "surface_area_um2_a": _clean_float(ra["surface_area_um2"]),
+                            "puncta_volume_um3_a": _clean_float(ra["puncta_volume_um3"]),
                             "pixel_count_b": int(rb["pixel_count"]),
-                            "mean_intensity_a": int(ra.get("mean_intensity", 0)),
-                            "max_intensity_a": int(ra.get("max_intensity", 0)),
-                            "mean_intensity_b": int(rb.get("mean_intensity", 0)),
-                            "max_intensity_b": int(rb.get("max_intensity", 0)),
-                            "centroid_x_a_um": int(ra["centroid_x_um"]),
-                            "centroid_y_a_um": int(ra["centroid_y_um"]),
-                            "centroid_z_a_um": int(ra["centroid_z_um"]),
-                            "centroid_x_b_um": int(rb["centroid_x_um"]),
-                            "centroid_y_b_um": int(rb["centroid_y_um"]),
-                            "centroid_z_b_um": int(rb["centroid_z_um"]),
+                            "voxel_count_b": int(rb["voxel_count"]),
+                            "surface_area_um2_b": _clean_float(rb["surface_area_um2"]),
+                            "puncta_volume_um3_b": _clean_float(rb["puncta_volume_um3"]),
+                            "mean_intensity_a": _clean_float(ra.get("mean_intensity", 0)),
+                            "max_intensity_a": _clean_float(ra.get("max_intensity", 0)),
+                            "mean_intensity_b": _clean_float(rb.get("mean_intensity", 0)),
+                            "max_intensity_b": _clean_float(rb.get("max_intensity", 0)),
+                            "centroid_x_a_um": _clean_float(ra["centroid_x_um"], 0.0),
+                            "centroid_y_a_um": _clean_float(ra["centroid_y_um"], 0.0),
+                            "centroid_z_a_um": _clean_float(ra["centroid_z_um"], 0.0),
+                            "centroid_x_b_um": _clean_float(rb["centroid_x_um"], 0.0),
+                            "centroid_y_b_um": _clean_float(rb["centroid_y_um"], 0.0),
+                            "centroid_z_b_um": _clean_float(rb["centroid_z_um"], 0.0),
                             "inside_mesh_flag_a": bool(ra["inside_mesh_flag"]),
                             "inside_mesh_flag_b": bool(rb["inside_mesh_flag"]),
                             "within_surface_threshold_flag_a": bool(ra["within_surface_threshold_flag"]),
@@ -4712,25 +5180,40 @@ class UIWidget(QWidget):
                         dist_um = float(np.linalg.norm(center_a - center_b))
 
                         matched_rows.append({
+                            "dataset_name": str(st.get("dataset_name", "")),
+                            "cell_channel": str(st.get("cell_channel_name", "")),
+                            "cell_name": str(st.get("cell_display_name", "Cell")),
+                            "cell_volume_um3": _clean_float(st.get("cell_volume_um3", "")),
+                            "cell_surface_area_um2": _clean_float(st.get("cell_surface_area_um2", "")),
                             "channel_a": ch_a,
+                            "protein_role_a": str(ra["protein_role"]),
+                            "protein_name_a": str(ra["protein_name"]),
                             "channel_b": ch_b,
+                            "protein_role_b": str(rb["protein_role"]),
+                            "protein_name_b": str(rb["protein_name"]),
                             "puncta_id_a": int(ra["puncta_id"]),
                             "puncta_id_b": int(rb["puncta_id"]),
                             "match_mode": "voxel_overlap",
-                            "centroid_distance_um": _round_int(dist_um),
-                            "voxel_overlap_fraction_min_object_pct": _round_int(frac * 100.0),
+                            "centroid_distance_um": _clean_float(dist_um),
+                            "voxel_overlap_fraction_min_object_pct": _clean_float(frac * 100.0),
                             "pixel_count_a": int(ra["pixel_count"]),
+                            "voxel_count_a": int(ra["voxel_count"]),
+                            "surface_area_um2_a": _clean_float(ra["surface_area_um2"]),
+                            "puncta_volume_um3_a": _clean_float(ra["puncta_volume_um3"]),
                             "pixel_count_b": int(rb["pixel_count"]),
-                            "mean_intensity_a": int(ra.get("mean_intensity", 0)),
-                            "max_intensity_a": int(ra.get("max_intensity", 0)),
-                            "mean_intensity_b": int(rb.get("mean_intensity", 0)),
-                            "max_intensity_b": int(rb.get("max_intensity", 0)),
-                            "centroid_x_a_um": int(ra["centroid_x_um"]),
-                            "centroid_y_a_um": int(ra["centroid_y_um"]),
-                            "centroid_z_a_um": int(ra["centroid_z_um"]),
-                            "centroid_x_b_um": int(rb["centroid_x_um"]),
-                            "centroid_y_b_um": int(rb["centroid_y_um"]),
-                            "centroid_z_b_um": int(rb["centroid_z_um"]),
+                            "voxel_count_b": int(rb["voxel_count"]),
+                            "surface_area_um2_b": _clean_float(rb["surface_area_um2"]),
+                            "puncta_volume_um3_b": _clean_float(rb["puncta_volume_um3"]),
+                            "mean_intensity_a": _clean_float(ra.get("mean_intensity", 0)),
+                            "max_intensity_a": _clean_float(ra.get("max_intensity", 0)),
+                            "mean_intensity_b": _clean_float(rb.get("mean_intensity", 0)),
+                            "max_intensity_b": _clean_float(rb.get("max_intensity", 0)),
+                            "centroid_x_a_um": _clean_float(ra["centroid_x_um"], 0.0),
+                            "centroid_y_a_um": _clean_float(ra["centroid_y_um"], 0.0),
+                            "centroid_z_a_um": _clean_float(ra["centroid_z_um"], 0.0),
+                            "centroid_x_b_um": _clean_float(rb["centroid_x_um"], 0.0),
+                            "centroid_y_b_um": _clean_float(rb["centroid_y_um"], 0.0),
+                            "centroid_z_b_um": _clean_float(rb["centroid_z_um"], 0.0),
                             "inside_mesh_flag_a": bool(ra["inside_mesh_flag"]),
                             "inside_mesh_flag_b": bool(rb["inside_mesh_flag"]),
                             "within_surface_threshold_flag_a": bool(ra["within_surface_threshold_flag"]),
@@ -4751,7 +5234,10 @@ class UIWidget(QWidget):
                     QMessageBox.information(self, "Localization", "No localized puncta matches were found.")
                     return
 
-                save_name = f"{_safe_stem(ch_a)}_vs_{_safe_stem(ch_b)}_localization.csv"
+                save_name = (
+                    f"{_safe_stem(ch_a)}_vs_{_safe_stem(ch_b)}_"
+                    f"{_safe_stem(_channel_display_name(ch_a))}_vs_{_safe_stem(_channel_display_name(ch_b))}_localization.csv"
+                )
                 save_path, _ = QFileDialog.getSaveFileName(
                     self,
                     "Save localization CSV",
@@ -4763,15 +5249,12 @@ class UIWidget(QWidget):
                 if not str(save_path).lower().endswith(".csv"):
                     save_path = str(save_path) + ".csv"
 
-                csv_saved = False
-
                 try:
                     with open(save_path, "w", newline="", encoding="utf-8") as f:
                         fieldnames = list(matched_rows[0].keys())
                         writer = csv.DictWriter(f, fieldnames=fieldnames)
                         writer.writeheader()
                         writer.writerows(matched_rows)
-                    csv_saved = True
                 except Exception as e:
                     QMessageBox.critical(
                         self,
@@ -4784,16 +5267,16 @@ class UIWidget(QWidget):
                     rows_a_by_id = {int(r["puncta_id"]): r for r in rows_a}
                     rows_b_by_id = {int(r["puncta_id"]): r for r in rows_b}
 
-                    pts_pix = []
+                    pts_um = []
                     for m in matched_rows:
                         ra = rows_a_by_id.get(int(m["puncta_id_a"]))
                         rb = rows_b_by_id.get(int(m["puncta_id_b"]))
                         if ra is None or rb is None:
                             continue
 
-                        za = np.asarray(ra["_centroid_pix_zyx"], dtype=np.float32)
-                        zb = np.asarray(rb["_centroid_pix_zyx"], dtype=np.float32)
-                        pts_pix.append((za + zb) / 2.0)
+                        za = np.asarray(ra["_centroid_phys_zyx_um"], dtype=np.float32)
+                        zb = np.asarray(rb["_centroid_phys_zyx_um"], dtype=np.float32)
+                        pts_um.append((za + zb) / 2.0)
 
                     layer_name = f"Localized puncta pairs - {ch_a} vs {ch_b}"
 
@@ -4806,11 +5289,12 @@ class UIWidget(QWidget):
 
                     _upsert_points_layer(
                         layer_name,
-                        pts_pix,
+                        pts_um,
                         face_color="white",
                         size=7,
                         visible=True
                     )
+
 
                 except Exception as e:
                     QMessageBox.warning(
@@ -4825,13 +5309,10 @@ class UIWidget(QWidget):
                 QMessageBox.information(
                     self,
                     "Localization",
-                    f"Saved localization CSV to:\n{save_path}\n\n"
-                    f"Matched pairs: {len(matched_rows)}"
+                    f"Saved localization CSV to:\n{save_path}\n\nMatched pairs: {len(matched_rows)}"
                 )
                 _update_status(f"Saved localization CSV: {save_path}")
                 gc.collect()
-
-
 
             # ============================================================
             # Dock UI
@@ -4847,7 +5328,9 @@ class UIWidget(QWidget):
             assigned_lines = []
             for role in ordered_roles:
                 if role in accepted_roles:
-                    assigned_lines.append(f"{role}: {accepted_roles[role]['channel']}")
+                    assigned_lines.append(
+                        f"{role}: {accepted_roles[role].get('display_name', role)} | {accepted_roles[role]['channel']}"
+                    )
                 else:
                     assigned_lines.append(f"{role}: None")
 
@@ -4897,16 +5380,18 @@ class UIWidget(QWidget):
             x_spacing.valueChanged.connect(lambda _=None: _apply_spacing_from_widgets())
 
             # ------------------------------------------------------------
-            # Cell export
+            # Cell / mesh export
             # ------------------------------------------------------------
-            cell_export_group = QGroupBox("Cell-of-interest export")
+            cell_export_group = QGroupBox("Mesh export")
             cell_export_layout = QVBoxLayout(cell_export_group)
 
             save_cell_meta_btn = QPushButton("Save meta data from cell of interest")
             export_cell_obj_btn = QPushButton("Export cell of interest OBJ + JSON")
+            export_all_meshes_btn = QPushButton("Export all accepted meshes OBJ + JSON")
 
             cell_export_layout.addWidget(save_cell_meta_btn)
             cell_export_layout.addWidget(export_cell_obj_btn)
+            cell_export_layout.addWidget(export_all_meshes_btn)
             layout.addWidget(cell_export_group)
 
             # ------------------------------------------------------------
@@ -4922,7 +5407,8 @@ class UIWidget(QWidget):
                 if role not in accepted_roles:
                     continue
                 ch = accepted_roles[role]["channel"]
-                it = QListWidgetItem(f"{role} | {ch}")
+                nm = accepted_roles[role].get("display_name", role)
+                it = QListWidgetItem(f"{role} | {nm} | {ch}")
                 it.setData(Qt.UserRole, ch)
                 it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
                 it.setCheckState(Qt.Checked)
@@ -4940,7 +5426,7 @@ class UIWidget(QWidget):
             puncta_thr_row = QHBoxLayout()
             puncta_thr_row.addWidget(QLabel("Puncta voxel threshold (> value)"))
             puncta_voxel_threshold = QDoubleSpinBox()
-            puncta_voxel_threshold.setDecimals(0)
+            puncta_voxel_threshold.setDecimals(4)
             puncta_voxel_threshold.setRange(0, 10**12)
             puncta_voxel_threshold.setValue(0)
             puncta_thr_row.addWidget(puncta_voxel_threshold)
@@ -4949,7 +5435,7 @@ class UIWidget(QWidget):
             inside_row = QHBoxLayout()
             inside_row.addWidget(QLabel("Inside if overlap fraction >= (%)"))
             inside_frac = QDoubleSpinBox()
-            inside_frac.setDecimals(0)
+            inside_frac.setDecimals(2)
             inside_frac.setRange(0, 100)
             inside_frac.setValue(90)
             inside_row.addWidget(inside_frac)
@@ -4958,7 +5444,7 @@ class UIWidget(QWidget):
             shell_row = QHBoxLayout()
             shell_row.addWidget(QLabel("Surface shell threshold (µm)"))
             surface_shell_um = QDoubleSpinBox()
-            surface_shell_um.setDecimals(1)
+            surface_shell_um.setDecimals(3)
             surface_shell_um.setRange(0, 10**6)
             surface_shell_um.setValue(1)
             shell_row.addWidget(surface_shell_um)
@@ -5019,7 +5505,7 @@ class UIWidget(QWidget):
             loc_tol_row = QHBoxLayout()
             loc_tol_row.addWidget(QLabel("Centroid tolerance (µm)"))
             loc_centroid_tol_um = QDoubleSpinBox()
-            loc_centroid_tol_um.setDecimals(1)
+            loc_centroid_tol_um.setDecimals(3)
             loc_centroid_tol_um.setRange(0, 10**6)
             loc_centroid_tol_um.setValue(1)
             loc_tol_row.addWidget(loc_centroid_tol_um)
@@ -5028,7 +5514,7 @@ class UIWidget(QWidget):
             loc_overlap_row = QHBoxLayout()
             loc_overlap_row.addWidget(QLabel("Voxel overlap threshold (%)"))
             loc_voxel_overlap_pct = QDoubleSpinBox()
-            loc_voxel_overlap_pct.setDecimals(0)
+            loc_voxel_overlap_pct.setDecimals(2)
             loc_voxel_overlap_pct.setRange(0, 100)
             loc_voxel_overlap_pct.setValue(90)
             loc_overlap_row.addWidget(loc_voxel_overlap_pct)
@@ -5065,6 +5551,7 @@ class UIWidget(QWidget):
             # ============================================================
             save_cell_meta_btn.clicked.connect(lambda _=False: _save_cell_metadata_dialog())
             export_cell_obj_btn.clicked.connect(lambda _=False: _export_cell_mesh_obj())
+            export_all_meshes_btn.clicked.connect(lambda _=False: _export_all_accepted_meshes())
             restrict_btn.clicked.connect(lambda _=False: _restrict_selected_puncta())
             export_btn.clicked.connect(lambda _=False: _export_puncta_csv())
             localize_btn.clicked.connect(lambda _=False: _localize_selected_channels())
@@ -5091,7 +5578,9 @@ class UIWidget(QWidget):
             summary_lines = []
             for role in ordered_roles:
                 if role in accepted_roles:
-                    summary_lines.append(f"{role}: {accepted_roles[role]['channel']}")
+                    summary_lines.append(
+                        f"{role}: {accepted_roles[role].get('display_name', role)} | {accepted_roles[role]['channel']}"
+                    )
                 else:
                     summary_lines.append(f"{role}: None / N/A")
 
@@ -5099,7 +5588,11 @@ class UIWidget(QWidget):
                 self,
                 "Puncta Counter",
                 "Puncta counter opened.\n\n"
-                f"Voxel size (Z, Y, X): {tuple(float(x) for x in spacing0)}\n\n"
+                f"Dataset: {st.get('dataset_name', '')}\n"
+                f"Voxel size (Z, Y, X): {tuple(float(x) for x in spacing0)}\n"
+                f"Cell name: {st.get('cell_display_name', 'Cell')}\n"
+                f"Cell volume (um^3): {_clean_float(st.get('cell_volume_um3', ''), 0.0)}\n"
+                f"Cell surface area (um^2): {_clean_float(st.get('cell_surface_area_um2', ''), '')}\n\n"
                 "Accepted channels:\n"
                 + "\n".join(summary_lines)
                 + "\n\nSuggested workflow:\n"
@@ -5108,7 +5601,8 @@ class UIWidget(QWidget):
                 "3. Set puncta threshold, overlap %, shell distance, and display minimum.\n"
                 "4. Run restriction first to preview centroid layers.\n"
                 "5. Export puncta CSV.\n"
-                "6. Run localization export if needed."
+                "6. Export all meshes if needed.\n"
+                "7. Run localization export if needed."
             )
 
             return
@@ -5119,6 +5613,7 @@ class UIWidget(QWidget):
             except Exception:
                 pass
             traceback.print_exc()
+
 
     def _cell_counter_resolve_infer_weights(self, model_path: str = "") -> str:
         """
@@ -6980,8 +7475,8 @@ class UIWidget(QWidget):
             txt, ok = QInputDialog.getText(
                 self_parent,
                 "Channels",
-                f'Enter channel numbers (comma-separated) or "all":',
-                text="1",
+                "Enter channel numbers comma-separated or all",
+                text="1,"
             )
             if not ok or not txt:
                 return
@@ -7005,125 +7500,26 @@ class UIWidget(QWidget):
                 QMessageBox.warning(self_parent, "No Channels", "No valid channels selected")
                 return
 
-            # Keep references so dialogs don't get GC'd
-            self_parent._mask_tuners = getattr(self_parent, "_mask_tuners", [])
+            # Remove duplicates while keeping original order
+            seen = set()
+            choices = [c for c in choices if not (c in seen or seen.add(c))]
 
+            # Open one tuner at a time, block until it closes, then continue
             for chnum in choices:
                 idx = chnum - 1
                 arr = self_parent.channel_list[idx]
 
-                dlg = MaskTunerDialog(self_parent, idx, arr, file_path=self_parent.file_path)
-                dlg.setModal(False)
-
-                self_parent._mask_tuners.append(dlg)
-
-                # remove reference when actually destroyed
-                dlg.destroyed.connect(
-                    lambda _=None, d=dlg: self_parent._mask_tuners.remove(d)
-                    if d in self_parent._mask_tuners else None
+                dlg = MaskTunerDialog(
+                    self_parent,
+                    idx,
+                    arr,
+                    file_path=self_parent.file_path
                 )
-
-                dlg.show()
+                dlg.setModal(True)
+                dlg.exec_()
 
         gen_mask_btn.clicked.connect(do_generate_masks)
         v.addWidget(gen_mask_btn)
-
-    def threshold_channel_dialog(self, ch_idx):
-        """Simple threshold dialog with preview and confirm flow.
-        Uses the currently displayed slice for defaults and computes masks
-        across the full Z-stack when applying.
-        """
-        arr = np.asarray(self.channel_list[ch_idx])
-        if arr.ndim != 3:
-            QMessageBox.information(self, 'Single-slice', 'Channel has no Z dimension; thresholding will operate on full image')
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle(f'Threshold Channel {ch_idx+1}')
-        layout = QVBoxLayout()
-
-        # Slider for threshold
-        th_slider = QSlider(Qt.Horizontal)
-        th_slider.setRange(0, 65535)
-        # Default based on current Z slice (if available)
-        cur_z = int(getattr(self, 'current_z', 0))
-        if arr.ndim == 3:
-            cur_z = max(0, min(cur_z, arr.shape[0]-1))
-        default = int(np.percentile(arr[cur_z], 50)) if arr.size > 0 else 100
-        th_slider.setValue(default)
-        th_label = QLabel(str(default))
-        th_slider.valueChanged.connect(lambda v: th_label.setText(str(v)))
-
-        layout.addWidget(QLabel('Manual threshold'))
-        layout.addWidget(th_slider)
-        layout.addWidget(th_label)
-
-        # Preview button: shows mask preview across Z-stack
-        preview_btn = QPushButton('Preview Mask (full stack)')
-        def do_preview():
-            th = th_slider.value()
-            if arr.ndim == 3:
-                masks = np.zeros_like(arr, dtype=np.uint8)
-                for z in range(arr.shape[0]):
-                    masks[z] = compute_mask(arr[z], threshold=th, blur_enabled=False)
-                v = napari.Viewer()
-                v.add_image(arr, name=f'Ch{ch_idx+1} stack')
-                v.add_image(masks, name='Mask Preview', colormap='gray', opacity=0.6)
-            else:
-                mask = compute_mask(arr, threshold=th, blur_enabled=False)
-                v = napari.Viewer()
-                v.add_image(arr, name=f'Ch{ch_idx+1} image')
-                v.add_image(mask, name='Mask Preview', colormap='gray', opacity=0.6)
-        preview_btn.clicked.connect(do_preview)
-        layout.addWidget(preview_btn)
-
-        # Otsu auto-threshold button (uses current slice)
-        otsu_btn = QPushButton('Use Otsu (current slice)')
-        def do_otsu():
-            try:
-                if arr.ndim == 3:
-                    zidx = int(getattr(self, 'current_z', 0))
-                    zidx = max(0, min(zidx, arr.shape[0]-1))
-                    t = int(threshold_otsu(arr[zidx]))
-                else:
-                    t = int(threshold_otsu(arr))
-                th_slider.setValue(t)
-                th_label.setText(str(t))
-            except Exception as e:
-                QMessageBox.critical(self, 'Otsu Error', f'Otsu failed: {e}')
-        otsu_btn.clicked.connect(do_otsu)
-        layout.addWidget(otsu_btn)
-
-        # Confirm/cancel buttons
-        btns = QHBoxLayout()
-        ok_btn = QPushButton('Apply and Close')
-        cancel_btn = QPushButton('Cancel')
-        btns.addWidget(ok_btn)
-        btns.addWidget(cancel_btn)
-        layout.addLayout(btns)
-
-        def do_apply():
-            th = th_slider.value()
-            # compute full 3D mask or single mask
-            if arr.ndim == 3:
-                masks = np.zeros_like(arr, dtype=np.uint8)
-                for z in range(arr.shape[0]):
-                    masks[z] = compute_mask(arr[z], threshold=th)
-            else:
-                masks = compute_mask(arr, threshold=th)
-            # create mask layer and add controls in main UI
-            self.create_mask_layer(ch_idx, masks)
-            dialog.accept()
-
-        def do_cancel():
-            reply = QMessageBox.question(self, 'Still Thresholding?', 'Are you done thresholding this channel?', QMessageBox.Yes | QMessageBox.No)
-            if reply == QMessageBox.Yes:
-                dialog.reject()
-
-        ok_btn.clicked.connect(do_apply)
-        cancel_btn.clicked.connect(do_cancel)
-
-        dialog.setLayout(layout)
-        dialog.exec_()
 
     def create_mask_layer(self, ch_idx, mask_array):
         name = f"Channel {ch_idx+1} mask"
@@ -7235,18 +7631,22 @@ class UIWidget(QWidget):
             self.current_file_path = str(p)
             print(f"\n[load_channels] Loading: {p}")
 
-            if p.suffix.lower() == ".lif":
-                mmaps, clims, vox, temp = load_lif_memmap(p, max_ch=4)
-            else:
-                mmaps, clims, vox, temp = load_tiff_memmap(p, max_ch=4)
+            channel_mmaps, contrast_limits, voxel_size, temp_paths = load_image_memmap(
+                p,
+                scene_index=0,
+                max_ch=4,
+                chunk_size=64,
+                out_dtype=None,
+                flush_every=8,
+            )
 
-            # Debug: what did the loader return?
+
             try:
-                print(f"[load_channels] mmaps type={type(mmaps)}, len={len(mmaps) if mmaps is not None else 'None'}")
+                print(f"[load_channels] mmaps type={type(channel_mmaps)}, len={len(channel_mmaps) if channel_mmaps is not None else 'None'}")
             except Exception as _:
                 print("[load_channels] mmaps: (could not get len)")
 
-            if mmaps is None:
+            if channel_mmaps is None:
                 print("[load_channels] ERROR: mmaps is None")
                 QMessageBox.warning(self, "Load", "No channels returned by loader.")
                 return
@@ -7539,18 +7939,66 @@ class UIWidget(QWidget):
             return None
         return str(name)
 
-    def _is_mask_like(self, name, arr):
-        if "mask" in (name or "").lower():
-            return True
+    def _is_mask_like(self, name, arr, layer_obj=None):
+        """
+        Decide whether a layer should be treated as a binary mask.
+
+        IMPORTANT:
+        - Do NOT classify something as a mask just because its name contains "mask".
+        - Derived intensity layers like 'Mul(Channel 2)_xMask(Channel 1 mask)' must stay intensity.
+        """
+        nm = str(name or "").strip()
         a = np.asarray(arr)
+
+        lyr = layer_obj if layer_obj is not None else self._get_layer_by_name(nm)
         try:
-            u = np.unique(a)
-            if u.size <= 3 and set(u.tolist()).issubset({0, 1, 255}):
-                return True
+            md = dict(getattr(lyr, "metadata", {}) or {}) if lyr is not None else {}
+        except Exception:
+            md = {}
+
+        # Explicit metadata wins
+        if "is_mask" in md:
+            return bool(md["is_mask"])
+
+        kind = str(md.get("output_kind", "")).strip().lower()
+        if kind == "mask":
+            return True
+        if kind == "intensity":
+            return False
+
+        derived_kind = str(md.get("derived_kind", "")).strip().lower()
+        if derived_kind == "mask":
+            return True
+
+        # Only exact mask-style names count; not any name containing "mask"
+        if re.match(r"^Channel\s+\d+\s+mask$", nm, flags=re.IGNORECASE):
+            return True
+        if re.match(r"^Mask(\s*\(.*\))?$", nm, flags=re.IGNORECASE):
+            return True
+
+        # True binary-valued arrays count as masks
+        if a.dtype == np.bool_:
+            return True
+
+        try:
+            flat = a.ravel()
+            if np.issubdtype(a.dtype, np.floating):
+                flat = flat[np.isfinite(flat)]
+
+            if flat.size == 0:
+                return False
+
+            u = np.unique(flat)
+            if u.size <= 3:
+                vals = set(float(x) for x in u.tolist())
+                if vals.issubset({0.0, 1.0, 255.0}):
+                    return True
         except Exception:
             pass
+
         return False
-    
+
+
     def _resolve_stack3d(self, layer_name: str):
         """
         Return a full 3D stack (Z,Y,X) for any selectable layer name:
@@ -7773,8 +8221,10 @@ class UIWidget(QWidget):
 
     def generate_coloc_entire_stack(self):
         """
-        Multiply (mask x target) where target can be: mask, channel, or an existing derived layer.
-        Always operates on full 3D stacks (Z,Y,X) resolved from canonical storage, not the 2D view.
+        Multiply mask x target where:
+        - mask is always binarized as (mask > 0)
+        - target preserves intensity unless the selected target is truly a mask
+        - derived layer display matches the original target channel display
         """
         try:
             layer_names = [lyr.name for lyr in self.viewer.layers]
@@ -7783,13 +8233,17 @@ class UIWidget(QWidget):
                 return
 
             mask_name = self._pick_layer_name(
-                "Select Mask", "Select MASK layer (binarized as >0):", layer_names
+                "Select Mask",
+                "Select MASK layer (binarized as >0)",
+                layer_names,
             )
             if mask_name is None:
                 return
 
             target_name = self._pick_layer_name(
-                "Select Target", "Select TARGET layer (mask/channel/derived):", layer_names
+                "Select Target",
+                "Select TARGET layer (channel / mask / derived)",
+                layer_names,
             )
             if target_name is None:
                 return
@@ -7798,35 +8252,54 @@ class UIWidget(QWidget):
             target3 = self._resolve_stack3d(target_name)
 
             if mask3 is None or target3 is None:
-                QMessageBox.warning(self, "Missing data", "Could not resolve full stack for one of the selections.")
+                QMessageBox.warning(
+                    self,
+                    "Missing data",
+                    "Could not resolve full stack for one of the selections.",
+                )
                 return
 
             mask3 = np.asarray(mask3)
             target3 = np.asarray(target3)
 
             if mask3.ndim != 3 or target3.ndim != 3:
-                QMessageBox.warning(self, "Bad dims", f"Expected 3D stacks; got {mask3.ndim}D and {target3.ndim}D.")
+                QMessageBox.warning(
+                    self,
+                    "Bad dims",
+                    f"Expected 3D stacks; got {mask3.ndim}D and {target3.ndim}D.",
+                )
                 return
 
             if mask3.shape != target3.shape:
                 QMessageBox.warning(
                     self,
                     "Shape mismatch",
-                    f"Mask {mask3.shape} != Target {target3.shape}\n\n"
-                    "If you recently cropped the stack, please re-generate any masks/coloc "
-                    "layers using the cropped data before running colocalization."
+                    f"Mask {mask3.shape} != Target {target3.shape}",
                 )
                 return
 
+            mask_layer = self._get_layer_by_name(mask_name)
+            target_layer = self._get_layer_by_name(target_name)
+
             mask_bin = (mask3 > 0)
 
-            target_is_mask = self._is_mask_like(target_name, target3)
+            # Treat target as mask only if it is actually mask-like
+            try:
+                target_is_mask = self._is_mask_like(
+                    target_name,
+                    target3,
+                    layer_obj=target_layer,
+                )
+            except TypeError:
+                # Backward-compatible fallback if _is_mask_like still has old signature
+                target_is_mask = self._is_mask_like(target_name, target3)
 
             if target_is_mask:
                 out3 = (mask_bin & (target3 > 0)).astype(np.uint8)
                 out_is_mask = True
             else:
-                out3 = target3 * mask_bin.astype(target3.dtype)
+                # Preserve original target intensities inside the mask
+                out3 = np.asarray(target3) * mask_bin.astype(target3.dtype, copy=False)
                 out_is_mask = False
 
             requested_name = f"Mul({target_name})_xMask({mask_name})"
@@ -7840,8 +8313,7 @@ class UIWidget(QWidget):
             if out_is_mask:
                 cmap = "yellow"
             else:
-                tlay = self._get_layer_by_name(target_name)
-                cmap = getattr(tlay, "colormap", None) if tlay is not None else None
+                cmap = getattr(target_layer, "colormap", None) if target_layer is not None else None
                 cmap = cmap or "yellow"
 
             created_new = False
@@ -7861,36 +8333,138 @@ class UIWidget(QWidget):
                 except Exception:
                     pass
 
+            # Store metadata so future passes know if this derived layer is mask or intensity
+            try:
+                md = dict(getattr(lay, "metadata", {}) or {})
+            except Exception:
+                md = {}
+
+            md["derived_kind"] = "coloc"
+            md["source_target_layer_name"] = str(target_name)
+            md["mask_layer_name"] = str(mask_name)
+            md["reference_layer_name"] = str(target_name)
+            md["created_from_current_z"] = int(z0)
+            md["output_kind"] = "mask" if out_is_mask else "intensity"
+            md["is_mask"] = bool(out_is_mask)
+            md["source_dtype"] = str(target3.dtype)
+
+            try:
+                lay.metadata = md
+            except Exception:
+                pass
+
+            # Keep visual alignment from target layer
+            ref_layer = target_layer if target_layer is not None else mask_layer
+            if ref_layer is not None:
+                try:
+                    raw_s = getattr(ref_layer, "scale", None)
+                    if raw_s is not None:
+                        s = tuple(float(x) for x in raw_s)
+                        lay.scale = s[-2:] if len(s) >= 2 else (1.0, 1.0)
+                except Exception:
+                    pass
+
+                try:
+                    raw_t = getattr(ref_layer, "translate", None)
+                    if raw_t is not None:
+                        t = tuple(float(x) for x in raw_t)
+                        lay.translate = t[-2:] if len(t) >= 2 else (0.0, 0.0)
+                except Exception:
+                    pass
+
+            # Display settings:
+            # - masks use 0..1
+            # - intensity outputs inherit the ORIGINAL target layer display
             if out_is_mask:
                 try:
                     lay.contrast_limits = (0, 1)
                 except Exception:
                     pass
+            else:
+                try:
+                    if target_layer is not None and getattr(target_layer, "contrast_limits", None) is not None:
+                        lay.contrast_limits = tuple(float(x) for x in target_layer.contrast_limits)
+                except Exception:
+                    pass
 
-            # store derived using stable object key
+                try:
+                    if target_layer is not None and hasattr(target_layer, "gamma"):
+                        lay.gamma = float(getattr(target_layer, "gamma", 1.0))
+                except Exception:
+                    pass
+
+                try:
+                    if target_layer is not None and hasattr(target_layer, "opacity"):
+                        lay.opacity = float(getattr(target_layer, "opacity", 0.7))
+                except Exception:
+                    pass
+
+                try:
+                    if target_layer is not None and hasattr(target_layer, "blending"):
+                        lay.blending = getattr(target_layer, "blending", "additive")
+                except Exception:
+                    pass
+
+                try:
+                    if target_layer is not None and hasattr(target_layer, "interpolation"):
+                        lay.interpolation = getattr(target_layer, "interpolation", "nearest")
+                except Exception:
+                    pass
+
             self.derived_stacks = getattr(self, "derived_stacks", {})
             self.derived_layers = getattr(self, "derived_layers", {})
+
+            stale_keys = []
+            for old_k, old_lay in list(self.derived_layers.items()):
+                if getattr(old_lay, "name", None) == requested_name and old_lay is not lay:
+                    stale_keys.append(old_k)
+
+            for old_k in stale_keys:
+                try:
+                    del self.derived_layers[old_k]
+                except Exception:
+                    pass
+                try:
+                    del self.derived_stacks[old_k]
+                except Exception:
+                    pass
+
             k = id(lay)
             self.derived_stacks[k] = out3
             self.derived_layers[k] = lay
 
-            # NEW: create per-coloc sliders/controls (only once per layer)
-            # (If you re-run and update same named layer, controls won't duplicate.)
-            self._add_coloc_controls(
-                lay,
-                out3=out3,
-                title=f"Coloc: {lay.name}",
-                out_is_mask=bool(out_is_mask),
-            )
+            try:
+                self._add_coloc_controls(
+                    lay,
+                    out3,
+                    f"Coloc: {lay.name}",
+                    bool(out_is_mask),
+                )
+            except Exception:
+                pass
 
-            # force sync right now
-            self.z_changed(int(getattr(self, "current_z", 0)))
+            try:
+                self._update_aux_layers_for_z(int(getattr(self, "current_z", z0)))
+            except Exception:
+                pass
 
-            QMessageBox.information(self, "Done", f"Created/updated: {lay.name}")
+            if created_new:
+                QMessageBox.information(
+                    self,
+                    "Colocalization",
+                    f"Created layer:\n{requested_name}",
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "Colocalization",
+                    f"Updated layer:\n{requested_name}",
+                )
 
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Multiply failed: {e}")
-            
+            QMessageBox.critical(self, "Error", f"Colocalization failed: {e}")
+
+
     def generate_3d_surfaces(self):
         """
         3D surface generator (marching cubes) where surface color matches the
@@ -8732,10 +9306,13 @@ def main():
 
     try:
         # Load (memmap)
-        if file_path.suffix.lower() == ".lif":
-            channel_mmaps, contrast_limits, voxel_size, temp_paths = load_lif_memmap(file_path, max_ch=4)
-        else:
-            channel_mmaps, contrast_limits, voxel_size, temp_paths = load_tiff_memmap(file_path, max_ch=4)
+        channel_mmaps, contrast_limits, voxel_size, temp_paths = load_image_memmap(
+        file_path,
+        scene_index=0,
+        max_ch=4,
+        chunk_size=64,
+        out_dtype=None,
+        flush_every=8)
 
         print(f"Loaded {len(channel_mmaps)} channels (memmaps)")
 
@@ -8745,7 +9322,8 @@ def main():
         viewer.scale_bar.unit = "um"
         viewer.scale_bar.font_size = 12
         viewer.scale_bar.color = "white"
-
+        # z_um, x_um, y_um = voxel_size 
+        # z_um = abs(z_um)
         # Add channel layers
         channel_layers = []
         default_colormaps = ["blue", "green", "red", "magenta"]
