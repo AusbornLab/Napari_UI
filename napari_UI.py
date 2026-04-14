@@ -267,7 +267,7 @@ def load_tiff_memmap(path, max_ch=4, chunk_size=64, out_dtype=None, flush_every=
     Load TIFF with no Dask/AICS fallback.
     Prefer tifffile.memmap; fall back to tifffile.imread if memmap is unavailable.
     """
-    print("Creating memory-mapped arrays from TIFF (no dask)...")
+    print("Creating memory-mapped arrays from TIFF")
 
     try:
         arr = tifffile.memmap(str(path))
