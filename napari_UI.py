@@ -2668,7 +2668,7 @@ class UIWidget(QWidget):
 
             # Scale bar
             cc.scale_bar.visible = True
-            cc.scale_bar.unit = "um"
+            cc.scale_bar.unit = "pixels"
             cc.scale_bar.font_size = 12
             cc.scale_bar.color = "white"
             cc.scale_bar.box = True
@@ -2910,7 +2910,6 @@ class UIWidget(QWidget):
             layout.addLayout(model_path_row)
 
             def _browse_model():
-                # NOTE: using qt_viewer here matches your existing code; you can swap to cc.window._qt_window later.
                 pth = QFileDialog.getExistingDirectory(cc.window.qt_viewer, "Select model folder")
                 if pth:
                     model_path.setText(pth)
@@ -3286,7 +3285,7 @@ class UIWidget(QWidget):
                 vw.title = title
                 try:
                     vw.scale_bar.visible = True
-                    vw.scale_bar.unit = "um"
+                    vw.scale_bar.unit = "pixels"
                     vw.scale_bar.font_size = 12
                     vw.scale_bar.color = "white"
                     vw.scale_bar.box = True
@@ -8595,7 +8594,7 @@ class UIWidget(QWidget):
             v3.title = "3D Surfaces"
             try:
                 v3.scale_bar.visible = True
-                v3.scale_bar.unit = "um"
+                v3.scale_bar.unit = "pixels"
                 v3.scale_bar.font_size = 12
                 v3.scale_bar.color = "white"
                 v3.scale_bar.box = True
@@ -9134,7 +9133,7 @@ class UIWidget(QWidget):
             # -------- Create projection viewer --------
             proj = napari.Viewer()
             proj.scale_bar.visible = True
-            proj.scale_bar.unit = 'um'
+            proj.scale_bar.unit = 'pixels'
             proj.scale_bar.font_size = 12
             proj.scale_bar.color = 'white'
             projections = {}
@@ -9319,11 +9318,9 @@ def main():
         # Create napari viewer
         viewer = napari.Viewer()
         viewer.scale_bar.visible = True
-        viewer.scale_bar.unit = "um"
+        viewer.scale_bar.unit = "pixels"
         viewer.scale_bar.font_size = 12
         viewer.scale_bar.color = "white"
-        # z_um, x_um, y_um = voxel_size 
-        # z_um = abs(z_um)
         # Add channel layers
         channel_layers = []
         default_colormaps = ["blue", "green", "red", "magenta"]
